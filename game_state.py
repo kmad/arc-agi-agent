@@ -327,6 +327,24 @@ def analyze_frame(frame: np.ndarray, prev_frame: np.ndarray = None) -> str:
                 new_name = COLOR_MAP.get(nv, f"c{nv}")
                 lines.append(f"    {old_name}->{new_name}: {count}px")
 
+            # Detect movement direction from diff pattern
+            # New pixels appearing (were background, now object) = destination
+            # Old pixels disappearing (were object, now background) = source
+            new_positions = np.argwhere((prev_frame == bg_color) & (frame != bg_color))
+            old_positions = np.argwhere((prev_frame != bg_color) & (frame == bg_color))
+            if len(new_positions) > 0 and len(old_positions) > 0:
+                new_center = new_positions.mean(axis=0)
+                old_center = old_positions.mean(axis=0)
+                dr = new_center[0] - old_center[0]
+                dc = new_center[1] - old_center[1]
+                direction = []
+                if abs(dr) > 1:
+                    direction.append("DOWN" if dr > 0 else "UP")
+                if abs(dc) > 1:
+                    direction.append("RIGHT" if dc > 0 else "LEFT")
+                if direction:
+                    lines.append(f"  Movement: {'+'.join(direction)} (dr={dr:.1f}, dc={dc:.1f})")
+
     return "\n".join(lines)
 
 

@@ -34,25 +34,26 @@ class ExploreSignature(dspy.Signature):
     """You are systematically exploring an unknown puzzle game on a 64x64 grid.
 
     Your ONLY goal right now is to discover what each action does.
-    For each available action, you need to determine:
-    - Does it cause movement? In which direction? How many pixels?
-    - Does it interact with something? What changes?
-    - Does it do nothing? (blocked by wall, invalid state)
-    - Does it cost a resource? (timer bar, move counter)
+    Look at the 'Movement' line in the frame diff to determine direction.
+    For each available action, determine:
+    - DIRECTION: Does it move something UP, DOWN, LEFT, or RIGHT?
+    - MAGNITUDE: How many pixels does it shift?
+    - RANGE: Which rows/columns are affected?
+    - BLOCKED: Does it produce tiny/no change? (means it hit a wall)
 
-    Design an exploration sequence that tests EVERY available action
-    multiple times in different contexts (different positions on the grid).
-    Vary your sequences: don't just repeat the same action.
+    IMPORTANT: The 'Movement' field in the analysis tells you the DIRECTION
+    of the last action's effect. Compare across actions to build a direction map.
 
-    Output a batch of actions as a JSON list. MAXIMIZE DIVERSITY."""
+    Design an exploration sequence that tests EVERY available action.
+    Output a batch of actions as a JSON list."""
 
-    frame_analysis: str = dspy.InputField(desc="Programmatic analysis: objects by color, positions, sizes, shapes, diff from previous frame")
+    frame_analysis: str = dspy.InputField(desc="Programmatic analysis with Movement direction for last action")
     game_state: str = dspy.InputField(desc="Game state: step count, levels, recent actions")
-    action_effects_so_far: str = dspy.InputField(desc="What we know about each action's effect so far")
+    action_effects_so_far: str = dspy.InputField(desc="What we know about each action's effect so far, including movement direction")
     available_actions: str = dspy.InputField(desc="All available actions in this game")
 
-    exploration_plan: str = dspy.OutputField(desc="Which actions to test and why. What do we still NOT know?")
-    actions: str = dspy.OutputField(desc='JSON list of 6-12 actions designed to maximize information gain. e.g. ["ACTION1","ACTION2","ACTION1","ACTION3"]')
+    exploration_plan: str = dspy.OutputField(desc="Direction map so far: which action = which direction? What's still unknown?")
+    actions: str = dspy.OutputField(desc='JSON list of 4-8 actions. e.g. ["ACTION1","ACTION2","ACTION3","ACTION4"]')
 
 
 class HypothesizeSignature(dspy.Signature):
@@ -164,6 +165,7 @@ class Solver:
         # Knowledge accumulated across phases
         self.action_effects: dict[str, list[str]] = {a: [] for a in self.available_actions}
         self.action_effectiveness: dict[str, dict] = {}  # action -> {productive, tiny, total}
+        self.action_directions: dict[str, list[str]] = {}  # action -> observed directions
         self.hypotheses: list[dict] = []
         self.confirmed_mechanics: list[dict] = []
 
@@ -389,7 +391,9 @@ class Solver:
 
     def _execute(self, history: GameHistory, visual_obs: dict) -> list[str]:
         """EXECUTE: Fast goal-directed play using confirmed mechanics."""
-        actions_desc = ", ".join(self.available_actions)
+        # Determine which actions are currently effective
+        effective_actions = self._get_effective_actions()
+        actions_desc = ", ".join(effective_actions) if effective_actions else ", ".join(self.available_actions)
 
         visual_text = visual_obs.get("visual_analysis", "No visual analysis.")
         if "recommended_strategy" in visual_obs:
@@ -416,7 +420,18 @@ class Solver:
 
         actions = self._parse_batch_actions(result.actions)
 
-        # Don't inject diversity in EXECUTE — trust the plan
+        # Post-filter: remove blocked actions from the batch
+        if effective_actions and len(effective_actions) < len(self.available_actions):
+            blocked = set(self.available_actions) - set(effective_actions)
+            filtered = [a for a in actions if a not in blocked]
+            if filtered:
+                print(f"  [Execute] Filtered out blocked actions {blocked}, using: {filtered}")
+                actions = filtered
+            else:
+                # All actions were blocked ones — fall back to effective actions
+                actions = list(effective_actions) * 2
+                print(f"  [Execute] All proposed actions blocked, using effective: {actions}")
+
         return actions
 
     # ── Phase transition logic ──
@@ -460,29 +475,60 @@ class Solver:
         self._transition_to(SolverPhase.EXPLORE)
         self.action_effects = {a: [] for a in self.available_actions}
         self.action_effectiveness = {}
+        self.action_directions = {}
         self.hypotheses = []
         # Keep confirmed_mechanics — some may carry over between levels
 
     # ── Knowledge tracking ──
 
     def _update_action_effects(self, history: GameHistory):
-        """Extract action-effect pairs from recent history with rich diff info."""
+        """Extract action-effect pairs from recent history with rich diff info.
+        Also track movement directions per action."""
         import re
-        for step in history.steps[-20:]:
+        for i, step in enumerate(history.steps[-20:]):
             if step.action == "RESET" or not step.grid_diff:
                 continue
             action = step.action.split("(")[0]  # Strip coords from ACTION6(x,y)
             if action not in self.action_effects:
                 continue
 
-            # Build a richer effect description including step number
-            effect = f"step{step.step_number}: {step.grid_diff[:150]}"
+            # Compute direction from frame diff if we have two consecutive frames
+            direction_info = ""
+            step_idx = len(history.steps) - 20 + i
+            if step_idx > 0 and step_idx < len(history.steps):
+                prev_step = history.steps[step_idx - 1]
+                if prev_step.frame is not None and step.frame is not None:
+                    prev_f = prev_step.frame
+                    curr_f = step.frame
+                    diff_mask = prev_f != curr_f
+                    if diff_mask.any():
+                        from config import COLOR_MAP
+                        bg = np.bincount(prev_f.flatten()).argmax()
+                        new_pos = np.argwhere((prev_f == bg) & (curr_f != bg))
+                        old_pos = np.argwhere((prev_f != bg) & (curr_f == bg))
+                        if len(new_pos) > 0 and len(old_pos) > 0:
+                            nc = new_pos.mean(axis=0)
+                            oc = old_pos.mean(axis=0)
+                            dr, dc = nc[0] - oc[0], nc[1] - oc[1]
+                            dirs = []
+                            if abs(dr) > 1: dirs.append("DOWN" if dr > 0 else "UP")
+                            if abs(dc) > 1: dirs.append("RIGHT" if dc > 0 else "LEFT")
+                            if dirs:
+                                direction_info = f" [DIRECTION: {'+'.join(dirs)}]"
+                                # Track direction per action
+                                dir_key = "+".join(dirs)
+                                if action not in self.action_directions:
+                                    self.action_directions[action] = []
+                                if dir_key not in self.action_directions[action]:
+                                    self.action_directions[action].append(dir_key)
+
+            # Build a richer effect description
+            effect = f"step{step.step_number}: {step.grid_diff[:120]}{direction_info}"
 
             # Keep only last 3 effects per action to stay current
             effects = self.action_effects[action]
             if len(effects) >= 3:
                 effects.pop(0)
-            # Avoid exact duplicates but allow similar effects (different steps)
             if not any(step.grid_diff[:80] in e for e in effects):
                 effects.append(effect)
 
@@ -513,12 +559,22 @@ class Solver:
                 stats["productive"] += 1
 
     def _format_action_effects(self) -> str:
-        """Format known action effects for prompts, including effectiveness warnings."""
+        """Format known action effects for prompts, including direction and effectiveness."""
         lines = []
+
+        # Direction summary at top (most useful info)
+        if self.action_directions:
+            lines.append("=== ACTION DIRECTION MAP ===")
+            for action in sorted(self.action_directions.keys()):
+                dirs = self.action_directions[action]
+                lines.append(f"  {action} -> {', '.join(dirs)}")
+            lines.append("")
+
         for action in sorted(self.action_effects.keys()):
             effects = self.action_effects[action]
+            dir_str = f" [DIR: {','.join(self.action_directions.get(action, ['?']))}]" if action in self.action_directions else ""
             if effects:
-                lines.append(f"{action}: {'; '.join(effects)}")
+                lines.append(f"{action}{dir_str}: {'; '.join(effects)}")
             else:
                 lines.append(f"{action}: NOT YET TESTED")
 
@@ -556,6 +612,25 @@ class Solver:
                 lines.append(f"  {action}: {stats['productive']} productive, {stats['tiny']} tiny/blocked out of {stats['total']} total -> {status}")
 
         return "\n".join(lines)
+
+    def _get_effective_actions(self) -> list[str]:
+        """Return actions that are currently producing useful changes.
+        If we don't have enough data, return all actions."""
+        if not self.action_effectiveness:
+            return list(self.available_actions)
+
+        effective = []
+        for action in self.available_actions:
+            stats = self.action_effectiveness.get(action)
+            if not stats or stats["total"] < 2:
+                # Not enough data — assume it works
+                effective.append(action)
+            elif stats["productive"] > 0:
+                # At least some productive results
+                effective.append(action)
+            # else: action has been tested and is consistently tiny/blocked
+
+        return effective if effective else list(self.available_actions)
 
     # ── Utility methods ──
 
