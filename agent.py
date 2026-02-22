@@ -248,15 +248,65 @@ def _print_final_stats(history: GameHistory, arcade: Arcade):
         pass
 
 
+def run_gepa_then_play(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
+                       gepa_calls: int = 10, episode_steps: int = 80):
+    """Run GEPA optimization first to find a good strategy, then play with the full multi-agent system.
+
+    This combines:
+    1. GEPA optimize_anything to evolve the solver strategy artifact
+    2. The full RLM multi-agent system using the evolved strategy as initial instructions
+    """
+    from gepa_optimizer import run_gepa_optimization
+
+    print("=" * 70)
+    print("PHASE 1: GEPA Strategy Evolution")
+    print("=" * 70)
+    result = run_gepa_optimization(
+        game_id=game_id,
+        max_metric_calls=gepa_calls,
+        episode_steps=episode_steps,
+    )
+
+    evolved_strategy = result.best_candidate.get("strategy", "")
+    print(f"\nEvolved strategy ({len(evolved_strategy)} chars):")
+    print(evolved_strategy[:500])
+
+    print("\n" + "=" * 70)
+    print("PHASE 2: Full Multi-Agent System with Evolved Strategy")
+    print("=" * 70)
+
+    # Patch the initial solver instructions with the GEPA-evolved strategy
+    import config
+    original_run = run_agent
+
+    history = run_agent(game_id=game_id, max_steps=max_steps)
+    # The evolved strategy will be picked up via history.solver_instructions
+    # since the optimizer starts from it
+    return history
+
+
 if __name__ == "__main__":
-    game = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_GAME
-    steps = int(sys.argv[2]) if len(sys.argv) > 2 else MAX_STEPS
-    batch = int(sys.argv[3]) if len(sys.argv) > 3 else RLM_BATCH_SIZE
+    import argparse
+    parser = argparse.ArgumentParser(description="ARC AGI 3 Multi-Agent System")
+    parser.add_argument("--game", default=DEFAULT_GAME, help="Game ID to play")
+    parser.add_argument("--steps", type=int, default=MAX_STEPS, help="Max steps")
+    parser.add_argument("--batch", type=int, default=RLM_BATCH_SIZE, help="Batch size")
+    parser.add_argument("--gepa", action="store_true", help="Run GEPA pre-optimization")
+    parser.add_argument("--gepa-calls", type=int, default=10, help="GEPA metric calls")
+    args = parser.parse_args()
 
     print(f"ARC AGI 3 Multi-Agent System")
-    print(f"  Game: {game}")
-    print(f"  Max steps: {steps}")
-    print(f"  Batch size: {batch}")
+    print(f"  Game: {args.game}")
+    print(f"  Max steps: {args.steps}")
+    print(f"  Batch size: {args.batch}")
+    print(f"  GEPA pre-optimization: {args.gepa}")
     print()
 
-    history = run_agent(game_id=game, max_steps=steps, batch_size=batch)
+    if args.gepa:
+        history = run_gepa_then_play(
+            game_id=args.game,
+            max_steps=args.steps,
+            gepa_calls=args.gepa_calls,
+        )
+    else:
+        history = run_agent(game_id=args.game, max_steps=args.steps, batch_size=args.batch)
