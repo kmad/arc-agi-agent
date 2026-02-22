@@ -1,10 +1,14 @@
 """Game state tracking and history management."""
 
+import os
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
 import json
 import io
+
+# Directory for persisting knowledge between runs
+KB_DIR = "knowledge_base"
 
 
 @dataclass
@@ -29,6 +33,11 @@ class GameHistory:
     total_levels: int = 0
     levels_completed: int = 0
 
+    # Per-level tracking
+    level_knowledge: dict[int, list[dict]] = field(default_factory=dict)
+    level_attempts: dict[int, int] = field(default_factory=lambda: {})
+    level_best_actions: dict[int, list[str]] = field(default_factory=dict)
+
     def add_step(self, step: StepRecord):
         self.steps.append(step)
         self.levels_completed = step.levels_completed
@@ -50,17 +59,144 @@ class GameHistory:
     def get_recent_actions(self, n: int = 20) -> list[str]:
         return [s.action for s in self.steps[-n:]]
 
+    def get_recent_action_diffs(self, n: int = 15) -> str:
+        """Get recent action->diff pairs so the solver can see what worked."""
+        lines = []
+        for step in self.steps[-n:]:
+            if step.action == "RESET":
+                continue
+            diff = step.grid_diff or "?"
+            # Classify the diff by impact
+            if "No change" in diff:
+                impact = "NO_EFFECT"
+            elif "pixels changed" in diff:
+                import re
+                m = re.search(r"(\d+) pixels changed", diff)
+                px = int(m.group(1)) if m else 0
+                if px <= 4:
+                    impact = "TINY (progress bar only)"
+                elif px <= 60:
+                    impact = "MEDIUM (player moved)"
+                else:
+                    impact = "LARGE (screen transition)"
+            else:
+                impact = "UNKNOWN"
+            lines.append(f"  Step {step.step_number}: {step.action} -> {impact} | {diff[:80]}")
+        return "\n".join(lines) if lines else "No history yet."
+
+    def is_stuck(self, window: int = 10) -> tuple[bool, str]:
+        """Detect if the agent is stuck repeating unproductive actions."""
+        recent = self.steps[-window:]
+        if len(recent) < window:
+            return False, ""
+
+        actions = [s.action for s in recent if s.action != "RESET"]
+        if not actions:
+            return False, ""
+
+        # Check if all actions are the same
+        from collections import Counter
+        counts = Counter(actions)
+        dominant_action, dominant_count = counts.most_common(1)[0]
+
+        if dominant_count < window * 0.8:
+            return False, ""
+
+        # Check if diffs are all tiny (<=4 pixels = just progress bar)
+        import re
+        tiny_count = 0
+        for s in recent:
+            if s.grid_diff and "pixels changed" in s.grid_diff:
+                m = re.search(r"(\d+) pixels changed", s.grid_diff)
+                if m and int(m.group(1)) <= 4:
+                    tiny_count += 1
+
+        if tiny_count >= window * 0.7:
+            return True, (
+                f"STUCK: Last {window} actions were mostly {dominant_action} "
+                f"with only tiny pixel changes (progress bar). "
+                f"The player is NOT moving. Try different actions!"
+            )
+
+        return False, ""
+
+    def detect_level_transition(
+        self,
+        prev_levels: int,
+        new_levels: int,
+        prev_frame: np.ndarray,
+        new_frame: np.ndarray,
+    ) -> str:
+        """Classify what kind of transition happened between two steps.
+
+        Returns one of:
+            "level_complete" - a new level was completed
+            "full_reset" - game reset to beginning (levels went backwards)
+            "level_reset" - same level count but big frame change (level restarted)
+            "none" - no transition detected
+        """
+        if new_levels > prev_levels:
+            return "level_complete"
+
+        if new_levels < prev_levels:
+            return "full_reset"
+
+        # Check for large frame change that could indicate level reset
+        if prev_frame is not None and new_frame is not None:
+            diff = prev_frame != new_frame
+            changed = np.sum(diff)
+            total = prev_frame.size
+            # If >50% of pixels changed, likely a reset
+            if changed > total * 0.5:
+                return "level_reset"
+
+        return "none"
+
+    def on_level_complete(self, level_num: int, actions: list[str]) -> None:
+        """Record that a level was completed with the given action sequence."""
+        if level_num not in self.level_knowledge:
+            self.level_knowledge[level_num] = []
+
+        self.level_knowledge[level_num].append({
+            "completed_at_step": self.current_step,
+            "action_count": len(actions),
+        })
+
+        # Track best (shortest) action sequence for this level
+        if level_num not in self.level_best_actions or len(actions) < len(self.level_best_actions[level_num]):
+            self.level_best_actions[level_num] = actions
+
+    def get_level_knowledge(self, level_num: int) -> list[dict]:
+        """Get accumulated knowledge for a specific level."""
+        return self.level_knowledge.get(level_num, [])
+
     def get_state_summary(self) -> str:
         """Get a compact summary of current game state."""
+        current_level = self.levels_completed + 1
+        attempts = self.level_attempts.get(current_level, 0)
+
         lines = [
             f"Game: {self.game_id}",
             f"Step: {self.current_step}",
             f"Levels completed: {self.levels_completed}/{self.total_levels}",
+            f"Current level: {current_level} (attempt #{attempts + 1})",
             f"State: {self.steps[-1].state if self.steps else 'NOT_STARTED'}",
         ]
+
+        # Add level-specific knowledge if available
+        level_kb = self.get_level_knowledge(current_level)
+        if level_kb:
+            lines.append(f"Level {current_level} knowledge: {len(level_kb)} entries")
+
         if self.steps:
             recent = self.get_recent_actions(10)
             lines.append(f"Recent actions: {', '.join(recent)}")
+
+            # Add stuck warning if applicable
+            stuck, msg = self.is_stuck()
+            if stuck:
+                lines.append(f"\n*** WARNING: {msg} ***")
+
         return "\n".join(lines)
 
     def get_game_kb_text(self) -> str:
@@ -86,6 +222,43 @@ class GameHistory:
             text = entry.get("text", "")
             entries.append(f"[{category}] {text}")
         return "\n".join(entries)
+
+    def save_knowledge(self):
+        """Persist knowledge bases to disk for bootstrapping future runs."""
+        os.makedirs(KB_DIR, exist_ok=True)
+        kb_path = os.path.join(KB_DIR, f"{self.game_id}.json")
+        data = {
+            "game_id": self.game_id,
+            "game_knowledge_base": self.game_knowledge_base,
+            "repl_knowledge_base": self.repl_knowledge_base,
+            "solver_instructions": self.solver_instructions,
+            "total_steps": self.current_step,
+            "levels_completed": self.levels_completed,
+            "level_knowledge": {str(k): v for k, v in self.level_knowledge.items()},
+            "level_attempts": {str(k): v for k, v in self.level_attempts.items()},
+            "level_best_actions": {str(k): v for k, v in self.level_best_actions.items()},
+        }
+        with open(kb_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def load_knowledge(self) -> bool:
+        """Load persisted knowledge from a previous run. Returns True if loaded."""
+        kb_path = os.path.join(KB_DIR, f"{self.game_id}.json")
+        if not os.path.exists(kb_path):
+            return False
+        try:
+            with open(kb_path) as f:
+                data = json.load(f)
+            self.game_knowledge_base = data.get("game_knowledge_base", [])
+            self.repl_knowledge_base = data.get("repl_knowledge_base", [])
+            self.solver_instructions = data.get("solver_instructions", "")
+            # Load level-specific data
+            self.level_knowledge = {int(k): v for k, v in data.get("level_knowledge", {}).items()}
+            self.level_attempts = {int(k): v for k, v in data.get("level_attempts", {}).items()}
+            self.level_best_actions = {int(k): v for k, v in data.get("level_best_actions", {}).items()}
+            return True
+        except (json.JSONDecodeError, KeyError):
+            return False
 
 
 def compute_grid_diff(prev: np.ndarray, curr: np.ndarray) -> str:

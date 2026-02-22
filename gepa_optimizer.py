@@ -17,45 +17,44 @@ from arcengine.enums import GameAction, GameState
 from arc_agi import Arcade
 
 from config import GEMINI_MODEL, GEMINI_MODEL_MINI
+from actions import build_action_map, format_action_space, get_valid_action_names
 from game_state import (
     GameHistory, StepRecord, compute_grid_diff, frame_to_text,
 )
 
 
-# === Seed strategy artifact ===
+# === Seed strategy artifact (game-agnostic) ===
 SEED_STRATEGY = """# ARC AGI 3 Solver Strategy
 
-## Grid Analysis Protocol
-1. On each turn, identify the active region of the grid (non-background pixels)
-2. Find the player block: look for a small colored cluster (typically 5x5) that changes position between frames
-3. Find the goal: look for matching color patterns or outlined regions
-4. Identify obstacles: walls, barriers, or other collidable sprites
+## Discovery Protocol
+1. This is an unknown game on a 64x64 grid. Do NOT assume any specific game type.
+2. Begin by trying every available action and carefully observing pixel changes.
+3. Large pixel changes (40+) indicate a meaningful game action (movement, interaction).
+4. Tiny pixel changes (2-4) may indicate a timer, counter, or resource bar ticking.
+5. No change means the action is blocked or invalid in the current context.
 
-## Movement Rules
-- ACTION1 = UP: Moves player block 5 pixels up
-- ACTION2 = DOWN: Moves player block 5 pixels down
-- ACTION3 = LEFT: Moves player block 5 pixels left
-- ACTION4 = RIGHT: Moves player block 5 pixels right
+## Grid Analysis
+1. Identify the active region: find all non-zero pixels and their bounding box.
+2. Look for color clusters: groups of same-colored pixels that may be game objects.
+3. Track changes between frames to identify moving objects vs. static structures.
+4. Note any repeating patterns, borders, or symmetric structures.
 
-## Strategy
-1. First, explore to understand the grid layout
-2. Identify the goal location relative to the player
-3. Plan the shortest path avoiding obstacles
-4. Execute the path as a batch of actions
-5. After each batch, re-analyze to correct course
+## Action Strategy
+1. First batch: Try each available action 2-3 times and record effects.
+2. Classify actions: which ones move something? Which ones interact? Which are blocked?
+3. Once you understand movement, identify the goal (what changes when you progress).
+4. Plan efficient paths: minimize actions to conserve any resource/timer.
 
-## REPL Analysis Tips
-- Use numpy to find unique colors: np.unique(grid)
-- Find player position: np.argwhere(grid == player_color)
-- Find goal position: np.argwhere(grid == goal_color)
-- Compute distance: abs(player_pos - goal_pos)
-- Check for walls between player and goal
+## Adaptive Play
+- If stuck (same tiny changes repeatedly): try completely different actions.
+- If a large screen change occurs: you may have completed a level or triggered a reset.
+- Watch for resource depletion: if a bar fills up or counts down, you're on a timer.
+- Prioritize exploration early, execution once you understand the mechanics.
 
-## Known Game Patterns
-- Move limit bar (yellow/dark_yellow) depletes with each action
-- Some levels require matching shapes or colors
-- The player block and goal may share a color/pattern
-- Interaction (ACTION5 if available) may be needed at the goal
+## Level Progression
+- Each game has multiple levels. Completing one may change the grid layout entirely.
+- Knowledge from earlier levels may or may not apply to later ones.
+- After each level transition, re-explore before committing to a strategy.
 """
 
 
@@ -86,6 +85,12 @@ def create_evaluator(game_id: str = "ls20", max_episode_steps: int = 100):
         obs = env.reset()
         initial_frame = np.array(obs.frame)[0]
 
+        # Build dynamic action map
+        action_map = build_action_map(obs.available_actions)
+        valid_action_names = get_valid_action_names(action_map)
+        actions_desc = format_action_space(action_map)
+        action_names_list = sorted(valid_action_names, key=lambda n: int(n.replace("ACTION", "")))
+
         win_levels = obs.win_levels
         levels_completed = 0
         steps_taken = 0
@@ -100,10 +105,11 @@ def create_evaluator(game_id: str = "ls20", max_episode_steps: int = 100):
                 "current_frame": dspy.InputField(desc="Current game grid"),
                 "action_history": dspy.InputField(desc="Recent actions taken"),
                 "frame_changes": dspy.InputField(desc="Recent frame changes"),
+                "available_actions": dspy.InputField(desc="Available actions in this game"),
             },
-            "You are playing an ARC AGI 3 game. Follow the strategy to decide the next action."
+            "You are playing an unknown ARC AGI 3 puzzle game. Follow the strategy to decide the next action."
         ).append("reasoning", dspy.OutputField(), type_=str
-        ).append("action", dspy.OutputField(desc="One of: ACTION1, ACTION2, ACTION3, ACTION4"), type_=str)
+        ).append("action", dspy.OutputField(desc="One action from the available set"), type_=str)
 
         predict = dspy.Predict(solver_sig)
         prev_frame = initial_frame
@@ -120,21 +126,16 @@ def create_evaluator(game_id: str = "ls20", max_episode_steps: int = 100):
                         current_frame=frame_to_text(current_frame),
                         action_history=", ".join(action_history[-10:]) or "None",
                         frame_changes="\n".join(frame_diffs[-5:]),
+                        available_actions=actions_desc,
                     )
                     action_str = pred.action.strip().upper()
                     # Extract valid action
-                    valid = {"ACTION1", "ACTION2", "ACTION3", "ACTION4"}
-                    action_name = next((a for a in valid if a in action_str), "ACTION1")
+                    action_name = next((a for a in valid_action_names if a in action_str), action_names_list[0])
                 except Exception as e:
                     errors.append(f"Step {step}: {str(e)}")
-                    action_name = "ACTION1"
+                    action_name = action_names_list[0]
 
-                game_action = {
-                    "ACTION1": GameAction.ACTION1,
-                    "ACTION2": GameAction.ACTION2,
-                    "ACTION3": GameAction.ACTION3,
-                    "ACTION4": GameAction.ACTION4,
-                }[action_name]
+                game_action = action_map[action_name]
 
                 try:
                     result = env.step(game_action)
@@ -166,12 +167,21 @@ def create_evaluator(game_id: str = "ls20", max_episode_steps: int = 100):
             if len(set(last_20)) <= 2:
                 stuck = True
 
+        # Action diversity metric (0-1, higher = more diverse)
+        action_diversity = len(set(action_history)) / max(len(valid_action_names), 1) if action_history else 0
+
+        # Exploration score: ratio of unique actions used in first 20 steps
+        early_actions = action_history[:20]
+        exploration_score = len(set(early_actions)) / max(len(valid_action_names), 1) if early_actions else 0
+
         asi = {
             "levels_completed": levels_completed,
             "total_levels": win_levels,
             "steps_taken": steps_taken,
             "action_distribution": dict(action_dist),
             "stuck_detected": stuck,
+            "action_diversity": round(action_diversity, 3),
+            "exploration_score": round(exploration_score, 3),
             "errors": errors[:10],
             "last_frame_changes": frame_diffs[-5:],
             "final_state": str(result.state) if 'result' in dir() else "UNKNOWN",

@@ -97,9 +97,11 @@ class GameMechanicsSignature(dspy.Signature):
 class GameMechanicsObserver:
     """RLM-based observer that builds a knowledge base of game mechanics."""
 
-    def __init__(self, lm: dspy.LM, sub_lm: Optional[dspy.LM] = None):
+    def __init__(self, lm: dspy.LM, sub_lm: Optional[dspy.LM] = None,
+                 action_desc: str = ""):
         self.lm = lm
         self.sub_lm = sub_lm or lm
+        self.action_desc = action_desc
         # Use RLM for deep analysis when history is large
         self.rlm = dspy.RLM(
             GameMechanicsSignature,
@@ -125,7 +127,8 @@ class GameMechanicsObserver:
             for i, obs in enumerate(visual_observations[-5:])
         ) if visual_observations else "No visual observations yet."
 
-        action_space = "ACTION1 (up), ACTION2 (down), ACTION3 (left), ACTION4 (right)"
+        # Use dynamic action description
+        action_space = self.action_desc or "Unknown action space"
 
         with dspy.context(lm=self.lm):
             # Use RLM for larger histories, predict for small ones

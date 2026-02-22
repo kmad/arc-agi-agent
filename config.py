@@ -9,8 +9,8 @@ load_dotenv()
 ARC_API_KEY = os.getenv("ARC_API_KEY")
 
 # Gemini configuration (via litellm/dspy)
-GEMINI_MODEL = "gemini/gemini-2.5-flash"
-GEMINI_MODEL_MINI = "gemini/gemini-2.5-flash"
+GEMINI_MODEL = "gemini/gemini-3-flash-preview"
+GEMINI_MODEL_MINI = "gemini/gemini-3-flash-preview"
 
 # RLM settings
 RLM_MAX_ITERATIONS = 25
@@ -19,6 +19,17 @@ RLM_BATCH_SIZE = 5  # Number of moves between reflection cycles
 # Game settings
 DEFAULT_GAME = "ls20"
 MAX_STEPS = 500
+
+# Color map for ARC grids (index -> name)
+# Default action labels for display (game-agnostic)
+DEFAULT_ACTION_LABELS = {
+    "ACTION1": "action 1",
+    "ACTION2": "action 2",
+    "ACTION3": "action 3",
+    "ACTION4": "action 4",
+    "ACTION5": "action 5",
+    "ACTION6": "action 6 (click)",
+}
 
 # Color map for ARC grids (index -> name)
 COLOR_MAP = {

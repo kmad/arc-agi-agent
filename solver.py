@@ -1,167 +1,193 @@
-"""Main RLM solver agent that plays the ARC AGI 3 game."""
+"""Main solver agent that plays the ARC AGI 3 game.
+
+Uses a fast CoT solver for action batches, with periodic RLM deep analysis."""
 
 import dspy
 import json
 import numpy as np
 from typing import Optional
 from game_state import GameHistory, frame_to_text, compute_grid_diff
+from actions import format_action_space, get_valid_action_names
 
 
-class SolverSignature(dspy.Signature):
-    """You are an expert AI agent playing an interactive puzzle game (ARC AGI 3).
-    You control a player on a 64x64 grid. Your goal is to complete all levels.
+class FastSolverSignature(dspy.Signature):
+    """You are playing an unknown interactive puzzle game on a 64x64 grid.
+    Your goal is to discover game mechanics through play and complete all levels.
 
-    Available actions:
-    - ACTION1: Move up (shifts player/block 5 pixels up)
-    - ACTION2: Move down (shifts player/block 5 pixels down)
-    - ACTION3: Move left (shifts player/block 5 pixels left)
-    - ACTION4: Move right (shifts player/block 5 pixels right)
+    APPROACH:
+    1. Early game: Explore systematically. Try every available action and observe what changes.
+       - Actions causing large pixel changes (40+) are meaningful moves.
+       - Actions causing tiny changes (2-4 pixels) may just be a timer/counter ticking.
+       - Actions causing no change may be blocked by walls or invalid in context.
+    2. Mid game: Once you understand which actions move you and what the goal is,
+       execute efficient sequences to progress.
+    3. Use the visual_analysis to understand spatial layout: find moving objects,
+       stationary structures, goals, and obstacles.
 
-    You have access to numpy, pandas, and a Python REPL to analyze the grid.
-    The grid uses integer color values (0=black, 1=blue, 2=red, 3=green,
-    4=yellow, 5=grey, 6=magenta, 7=orange, 8=cyan, 9=brown).
+    Output a BATCH of 3-8 actions as a JSON list. Prefer SHORT precise sequences."""
 
-    IMPORTANT: You must output exactly one action per call: ACTION1, ACTION2, ACTION3, or ACTION4.
-    Think carefully about the game state and your accumulated knowledge before acting.
+    current_frame: str = dspy.InputField(desc="Current 64x64 game grid (active region)")
+    game_state: str = dspy.InputField(desc="Current game state summary with stuck warnings")
+    recent_action_history: str = dspy.InputField(desc="Recent actions with their pixel change impacts - TINY means unproductive!")
+    knowledge: str = dspy.InputField(desc="Accumulated game knowledge and REPL tips")
+    visual_analysis: str = dspy.InputField(desc="Visual observer analysis of game objects and layout")
+    solver_directives: str = dspy.InputField(desc="Dynamic solver directives")
+    available_actions: str = dspy.InputField(desc="List of available actions in this game")
 
-    Strategy: Use the REPL to analyze the grid, find the player position, identify the goal,
-    and plan a path. Then output the next action to take."""
-
-    current_frame: str = dspy.InputField(desc="Current 64x64 game grid as text")
-    game_state: str = dspy.InputField(desc="Current game state summary")
-    game_knowledge: str = dspy.InputField(desc="Accumulated game mechanics knowledge base")
-    repl_knowledge: str = dspy.InputField(desc="REPL usage tips and patterns for this game")
-    visual_analysis: str = dspy.InputField(desc="Latest visual observer analysis")
-    solver_instructions: str = dspy.InputField(desc="Dynamic instructions from the optimizer")
-
-    reasoning: str = dspy.OutputField(desc="Your reasoning about what to do next")
-    action: str = dspy.OutputField(desc="Exactly one of: ACTION1, ACTION2, ACTION3, ACTION4")
+    reasoning: str = dspy.OutputField(desc="1. What objects do I see? 2. What changed from my last actions? 3. What should I try next?")
+    actions: str = dspy.OutputField(desc='JSON list of 3-8 actions from the available set. e.g. ["ACTION1","ACTION2","ACTION3"]')
 
 
-class BatchSolverSignature(dspy.Signature):
-    """You are an expert AI agent playing an interactive puzzle game (ARC AGI 3).
-    You control a player on a 64x64 grid. Your goal is to complete all levels.
+class DeepAnalysisSignature(dspy.Signature):
+    """You are deeply analyzing an unknown interactive puzzle game on a 64x64 grid.
+    Use careful grid analysis to understand the game state.
 
-    Available actions:
-    - ACTION1: Move up (shifts player/block 5 pixels up)
-    - ACTION2: Move down (shifts player/block 5 pixels down)
-    - ACTION3: Move left (shifts player/block 5 pixels left)
-    - ACTION4: Move right (shifts player/block 5 pixels right)
+    Analyze the grid to find:
+    - Color clusters: groups of same-colored pixels that may be objects
+    - Moving objects: compare with recent history to identify what moves
+    - Stationary structures: walls, borders, platforms, goals
+    - Patterns: repeating structures, symmetry, or arrangements that suggest a puzzle
 
-    You have access to numpy, pandas, and a Python REPL to analyze the grid.
-    The grid uses integer color values (0=black, 1=blue, 2=red, 3=green,
-    4=yellow, 5=grey, 6=magenta, 7=orange, 8=cyan, 9=brown).
+    Based on your analysis, plan actions to make progress (complete levels, reach goals,
+    solve the puzzle). Be efficient - each action may cost a resource."""
 
-    Output a BATCH of actions as a JSON list. Each action should be one of:
-    ACTION1, ACTION2, ACTION3, ACTION4.
-    Output between 1 and 10 actions that form a logical sequence toward the goal.
+    current_frame: str = dspy.InputField(desc="Current 64x64 game grid")
+    game_state: str = dspy.InputField(desc="Current game state summary with stuck warnings")
+    recent_action_history: str = dspy.InputField(desc="Recent actions with pixel change impacts")
+    knowledge: str = dspy.InputField(desc="All accumulated knowledge")
+    solver_directives: str = dspy.InputField(desc="Solver directives")
+    available_actions: str = dspy.InputField(desc="List of available actions in this game")
 
-    Use the REPL to analyze the grid, find the player, identify goals,
-    and plan an efficient path. Then output the batch of actions."""
-
-    current_frame: str = dspy.InputField(desc="Current 64x64 game grid as text")
-    game_state: str = dspy.InputField(desc="Current game state summary")
-    game_knowledge: str = dspy.InputField(desc="Accumulated game mechanics knowledge base")
-    repl_knowledge: str = dspy.InputField(desc="REPL usage tips and patterns for this game")
-    visual_analysis: str = dspy.InputField(desc="Latest visual observer analysis")
-    solver_instructions: str = dspy.InputField(desc="Dynamic instructions from the optimizer")
-
-    reasoning: str = dspy.OutputField(desc="Your analysis and reasoning for the planned actions")
-    actions: str = dspy.OutputField(desc='JSON list of actions, e.g. ["ACTION1", "ACTION3", "ACTION3", "ACTION2"]')
+    analysis: str = dspy.OutputField(desc="Object positions, movement patterns, identified goals, recommended strategy")
+    actions: str = dspy.OutputField(desc='JSON list of planned actions from the available set')
 
 
 class Solver:
-    """Main RLM-based solver agent."""
+    """Hybrid solver: fast CoT for most batches, RLM for periodic deep analysis."""
 
-    def __init__(self, lm: dspy.LM, sub_lm: Optional[dspy.LM] = None, batch_mode: bool = True):
+    def __init__(self, lm: dspy.LM, sub_lm: Optional[dspy.LM] = None,
+                 available_actions: Optional[list[str]] = None):
         self.lm = lm
         self.sub_lm = sub_lm or lm
-        self.batch_mode = batch_mode
+        self.available_actions = available_actions or ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
+        self.fast_solver = dspy.ChainOfThought(FastSolverSignature)
+        self.deep_solver = dspy.RLM(
+            DeepAnalysisSignature,
+            max_iterations=10,
+            sub_lm=self.sub_lm,
+        )
+        self.call_count = 0
 
-        if batch_mode:
-            self.rlm = dspy.RLM(
-                BatchSolverSignature,
-                max_iterations=15,
-                sub_lm=self.sub_lm,
-                tools=[],  # numpy/pandas available in sandbox
-            )
-        else:
-            self.rlm = dspy.RLM(
-                SolverSignature,
-                max_iterations=10,
-                sub_lm=self.sub_lm,
-            )
+    def solve_step(self, history: GameHistory, visual_obs: dict, deep: bool = False) -> list[str]:
+        """Decide the next batch of actions.
 
-    def solve_step(self, history: GameHistory, visual_obs: dict) -> list[str]:
-        """Decide the next action(s) to take.
-
-        Returns a list of action strings.
+        Args:
+            deep: If True, use RLM for deep analysis. Otherwise use fast CoT.
         """
+        self.call_count += 1
         current_frame = history.last_frame
         if current_frame is None:
-            return ["ACTION1"]  # Default first move
+            return self.available_actions[:5] if len(self.available_actions) >= 5 else list(self.available_actions)
+
+        # Check if stuck - force exploration if so
+        stuck, stuck_msg = history.is_stuck()
+        if stuck:
+            return self._forced_exploration(history)
 
         frame_text = frame_to_text(current_frame)
-        visual_text = visual_obs.get("visual_analysis", "No visual analysis available.")
+        visual_text = visual_obs.get("visual_analysis", "No visual analysis.")
         if "recommended_strategy" in visual_obs:
-            visual_text += f"\nRecommended strategy: {visual_obs['recommended_strategy']}"
+            visual_text += f"\nStrategy: {visual_obs['recommended_strategy']}"
 
-        solver_instructions = history.solver_instructions or (
-            "Explore the game board systematically. "
-            "Use the REPL to analyze the grid and find patterns. "
-            "Identify the player (movable colored block), the goal, and obstacles. "
-            "Plan efficient paths to minimize wasted moves."
+        solver_directives = history.solver_instructions or (
+            "Discover a new game. Explore systematically. "
+            "Try all available actions and observe pixel changes. "
+            "Large changes (40+ pixels) indicate meaningful moves. "
+            "Tiny changes (2-4 pixels) may just be a counter/timer."
         )
 
+        # Combine knowledge bases
+        knowledge = history.get_game_kb_text() + "\n\n" + history.get_repl_kb_text()
+
+        # Recent action history with diffs
+        recent_diffs = history.get_recent_action_diffs(15)
+
+        actions_desc = ", ".join(self.available_actions)
+
         with dspy.context(lm=self.lm):
-            if self.batch_mode:
-                result = self.rlm(
+            if deep:
+                result = self.deep_solver(
                     current_frame=frame_text,
                     game_state=history.get_state_summary(),
-                    game_knowledge=history.get_game_kb_text(),
-                    repl_knowledge=history.get_repl_kb_text(),
-                    visual_analysis=visual_text,
-                    solver_instructions=solver_instructions,
+                    recent_action_history=recent_diffs,
+                    knowledge=knowledge,
+                    solver_directives=solver_directives,
+                    available_actions=actions_desc,
                 )
-                # Parse batch actions
-                actions = self._parse_batch_actions(result.actions)
-                return actions
             else:
-                result = self.rlm(
+                result = self.fast_solver(
                     current_frame=frame_text,
                     game_state=history.get_state_summary(),
-                    game_knowledge=history.get_game_kb_text(),
-                    repl_knowledge=history.get_repl_kb_text(),
+                    recent_action_history=recent_diffs,
+                    knowledge=knowledge,
                     visual_analysis=visual_text,
-                    solver_instructions=solver_instructions,
+                    solver_directives=solver_directives,
+                    available_actions=actions_desc,
                 )
-                action = self._parse_single_action(result.action)
-                return [action]
+
+        actions = self._parse_batch_actions(result.actions)
+
+        # Post-processing: ensure action diversity if actions are all the same
+        if len(actions) >= 5 and len(set(actions)) == 1:
+            actions = self._inject_exploration(actions)
+
+        return actions
+
+    def _forced_exploration(self, history: GameHistory) -> list[str]:
+        """When stuck, systematically try all directions to find which ones work."""
+        # Find which action the agent is stuck on
+        recent = history.get_recent_actions(10)
+        from collections import Counter
+        stuck_action = Counter(recent).most_common(1)[0][0]
+
+        # Try all OTHER available actions first, then the stuck one
+        other_actions = [a for a in self.available_actions if a != stuck_action]
+
+        # Systematic exploration: try each other action 3 times
+        explore = []
+        for action in other_actions:
+            explore.extend([action] * 3)
+        return explore
+
+    def _inject_exploration(self, actions: list[str]) -> list[str]:
+        """If solver outputs all-same actions, inject diversity."""
+        base = actions[0]
+        others = [a for a in self.available_actions if a != base]
+
+        # Replace some actions with exploration
+        result = list(actions)
+        for i, other in enumerate(others):
+            if i + 1 < len(result):
+                result[i + 1] = other
+        return result
 
     def _parse_batch_actions(self, actions_str: str) -> list[str]:
         """Parse a batch of actions from the solver output."""
-        valid_actions = {"ACTION1", "ACTION2", "ACTION3", "ACTION4"}
+        valid_actions = set(self.available_actions)
         try:
             actions = json.loads(actions_str)
             if isinstance(actions, list):
                 parsed = [a.strip().upper() for a in actions if isinstance(a, str)]
-                return [a for a in parsed if a in valid_actions] or ["ACTION1"]
+                result = [a for a in parsed if a in valid_actions]
+                if result:
+                    return result
         except (json.JSONDecodeError, TypeError):
             pass
 
         # Fallback: extract action names from text
         actions = []
-        for token in actions_str.upper().split():
-            clean = token.strip('[]",')
+        for token in actions_str.upper().replace(",", " ").replace('"', " ").replace("[", " ").replace("]", " ").split():
+            clean = token.strip()
             if clean in valid_actions:
                 actions.append(clean)
-        return actions or ["ACTION1"]
-
-    def _parse_single_action(self, action_str: str) -> str:
-        """Parse a single action from the solver output."""
-        valid_actions = {"ACTION1", "ACTION2", "ACTION3", "ACTION4"}
-        cleaned = action_str.strip().upper()
-        for valid in valid_actions:
-            if valid in cleaned:
-                return valid
-        return "ACTION1"  # Default
+        return actions or list(self.available_actions)
