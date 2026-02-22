@@ -8,9 +8,12 @@ load_dotenv()
 # ARC API
 ARC_API_KEY = os.getenv("ARC_API_KEY")
 
-# Gemini configuration (via litellm/dspy)
-GEMINI_MODEL = "gemini/gemini-3-flash-preview"
-GEMINI_MODEL_MINI = "gemini/gemini-3-flash-preview"
+# LLM configuration (via litellm/dspy)
+MAIN_MODEL = "openrouter/google/gemini-3-flash-preview"
+SUB_MODEL = "openrouter/google/gemini-3-flash-preview"
+# Legacy aliases
+GEMINI_MODEL = MAIN_MODEL
+GEMINI_MODEL_MINI = SUB_MODEL
 
 # RLM settings
 RLM_MAX_ITERATIONS = 25

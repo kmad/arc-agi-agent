@@ -261,6 +261,89 @@ class GameHistory:
             return False
 
 
+def analyze_frame(frame: np.ndarray, prev_frame: np.ndarray = None) -> str:
+    """Programmatic frame analysis: extracts objects, colors, regions, diffs.
+
+    Returns a structured text summary that replaces sending the raw grid to the LLM.
+    The LLM interprets meaning; numpy does the pixel math.
+    """
+    from config import COLOR_MAP
+    lines = []
+
+    # 1. Grid overview
+    unique_vals = np.unique(frame)
+    color_names = [f"{v}={COLOR_MAP.get(v, f'color{v}')}" for v in unique_vals]
+    lines.append(f"Grid: 64x64, colors present: {', '.join(color_names)}")
+
+    # 2. Color cluster analysis — find distinct objects by connected regions
+    bg_color = 0
+    # Find the most common color as potential background
+    vals, counts = np.unique(frame, return_counts=True)
+    bg_color = vals[counts.argmax()]
+    lines.append(f"Background: {bg_color}={COLOR_MAP.get(int(bg_color), '?')} ({counts.max()} pixels, {counts.max()*100//frame.size}%)")
+
+    # 3. Per-color region summary
+    for val in unique_vals:
+        if val == bg_color:
+            continue
+        mask = frame == val
+        pixel_count = mask.sum()
+        positions = np.argwhere(mask)
+        min_r, min_c = positions.min(axis=0)
+        max_r, max_c = positions.max(axis=0)
+        height = max_r - min_r + 1
+        width = max_c - min_c + 1
+        color_name = COLOR_MAP.get(int(val), f"color{val}")
+
+        # Classify shape
+        bbox_area = height * width
+        fill_ratio = pixel_count / max(bbox_area, 1)
+
+        if pixel_count <= 6:
+            shape = "dot/small sprite"
+        elif fill_ratio > 0.8 and height <= 3:
+            shape = "horizontal bar"
+        elif fill_ratio > 0.8 and width <= 3:
+            shape = "vertical bar"
+        elif fill_ratio > 0.7:
+            shape = "filled rectangle"
+        elif fill_ratio < 0.3:
+            shape = "sparse/scattered"
+        else:
+            shape = "irregular shape"
+
+        lines.append(
+            f"  {val}={color_name}: {pixel_count}px, rows {min_r}-{max_r} cols {min_c}-{max_c} "
+            f"({height}x{width}), {shape}, fill={fill_ratio:.0%}"
+        )
+
+    # 4. Frame diff (if previous frame provided)
+    if prev_frame is not None:
+        diff_mask = frame != prev_frame
+        n_changed = diff_mask.sum()
+        if n_changed == 0:
+            lines.append("Diff: No change from previous frame.")
+        else:
+            changed_pos = np.argwhere(diff_mask)
+            min_r, min_c = changed_pos.min(axis=0)
+            max_r, max_c = changed_pos.max(axis=0)
+            lines.append(f"Diff: {n_changed} pixels changed, region rows {min_r}-{max_r} cols {min_c}-{max_c}")
+
+            # What colors changed to what
+            old_vals = prev_frame[diff_mask]
+            new_vals = frame[diff_mask]
+            transitions = {}
+            for ov, nv in zip(old_vals, new_vals):
+                key = (int(ov), int(nv))
+                transitions[key] = transitions.get(key, 0) + 1
+            for (ov, nv), count in sorted(transitions.items(), key=lambda x: -x[1])[:5]:
+                old_name = COLOR_MAP.get(ov, f"c{ov}")
+                new_name = COLOR_MAP.get(nv, f"c{nv}")
+                lines.append(f"    {old_name}->{new_name}: {count}px")
+
+    return "\n".join(lines)
+
+
 def compute_grid_diff(prev: np.ndarray, curr: np.ndarray) -> str:
     """Compute a human-readable diff between two 64x64 grids."""
     if prev is None:

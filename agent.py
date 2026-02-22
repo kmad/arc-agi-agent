@@ -30,8 +30,6 @@ from optimizer import InstructionOptimizer
 
 # How often to run reflection agents (every N batches)
 REFLECT_EVERY = 3
-# How often to use deep RLM analysis (every N batches)
-DEEP_ANALYSIS_EVERY = 5
 
 
 def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
@@ -40,8 +38,8 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
 
     # === Configure LMs ===
     print(f"Configuring LMs: {GEMINI_MODEL}")
-    main_lm = dspy.LM(GEMINI_MODEL, max_tokens=16384)
-    mini_lm = dspy.LM(GEMINI_MODEL_MINI, max_tokens=8192)
+    main_lm = dspy.LM(GEMINI_MODEL, max_tokens=4096)
+    mini_lm = dspy.LM(GEMINI_MODEL_MINI, max_tokens=2048)
     dspy.configure(lm=main_lm)
 
     # === Initialize game ===
@@ -85,7 +83,7 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
 
     # === Initialize agents ===
     solver = Solver(lm=main_lm, sub_lm=mini_lm, available_actions=action_names)
-    visual_observer = VisualObserver(lm=main_lm)
+    visual_observer = VisualObserver(lm=main_lm, use_screenshots=False)
     mechanics_observer = GameMechanicsObserver(lm=main_lm, sub_lm=mini_lm, action_desc=action_desc)
     repl_observer = REPLStrategyObserver(lm=main_lm, sub_lm=mini_lm)
     optimizer = InstructionOptimizer(lm=main_lm)
@@ -102,11 +100,9 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
     # === Main game loop ===
     while move_count < max_steps:
         batch_number += 1
-        use_deep = (batch_number % DEEP_ANALYSIS_EVERY == 1)  # Deep on first batch, then every 5
-        mode = "DEEP" if use_deep else "FAST"
 
         print(f"\n{'='*70}")
-        print(f"BATCH {batch_number} [{mode}] | Step {move_count} | Levels: {history.levels_completed}/{history.total_levels}")
+        print(f"BATCH {batch_number} [{solver.phase_name.upper()}] | Step {move_count} | Levels: {history.levels_completed}/{history.total_levels}")
         print(f"{'='*70}")
 
         # --- Visual observation (quick, every batch) ---
@@ -122,7 +118,7 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
         # --- Solver decides actions ---
         t0 = time.time()
         try:
-            actions = solver.solve_step(history, vis_obs, deep=use_deep)
+            actions = solver.solve_step(history, vis_obs)
         except Exception as e:
             print(f"[Solver] ERROR: {e}")
             actions = action_names[:4] if len(action_names) >= 4 else list(action_names)  # Explore fallback
@@ -185,6 +181,7 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
                 print(f"\n  *** LEVEL {completed_level} COMPLETE at step {move_count}! ***")
                 history.on_level_complete(completed_level, level_actions_buffer)
                 level_actions_buffer = []
+                solver.on_level_transition()
                 # Force a reflection cycle on level completion
                 print(f"  --- Forced Reflection (level complete) ---")
                 _run_reflection(history, visual_observations, repl_traces,
@@ -195,12 +192,14 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
                 current_level = result.levels_completed + 1
                 history.level_attempts[current_level] = history.level_attempts.get(current_level, 0) + 1
                 level_actions_buffer = []
+                solver.on_level_transition()
                 print(f"\n  !!! FULL RESET detected. Level {current_level} attempt #{history.level_attempts[current_level]} !!!")
 
             elif transition == "level_reset":
                 current_level = result.levels_completed + 1
                 history.level_attempts[current_level] = history.level_attempts.get(current_level, 0) + 1
                 level_actions_buffer = []
+                solver.on_level_transition()
                 print(f"\n  !!! LEVEL RESET detected. Level {current_level} attempt #{history.level_attempts[current_level]} !!!")
 
             if result.state == GameState.WIN:

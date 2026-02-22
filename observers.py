@@ -3,7 +3,7 @@
 import dspy
 import json
 from typing import Optional
-from game_state import GameHistory, frame_to_text, frame_to_image_bytes
+from game_state import GameHistory, frame_to_text, frame_to_image_bytes, analyze_frame
 
 
 # ============================================================
@@ -12,52 +12,83 @@ from game_state import GameHistory, frame_to_text, frame_to_image_bytes
 
 class VisualObserverSignature(dspy.Signature):
     """You are a visual observer for an interactive puzzle game (ARC AGI 3).
-    Analyze the current game frame image and recent frame history.
-    Identify: player position, goal elements, obstacles, UI elements,
-    movement patterns, and any spatial relationships.
-    Be specific about grid coordinates and colors."""
+    You receive a screenshot of the game and a structured analysis of the grid.
+
+    The frame_analysis already tells you WHAT objects exist and WHERE they are.
+    Your job is to interpret the MEANING: what is the player? What is the goal?
+    What are obstacles? What strategy should we use?
+
+    Be specific about spatial relationships and movement patterns."""
 
     game_state_summary: str = dspy.InputField(desc="Current game state summary")
-    current_frame_text: str = dspy.InputField(desc="Current frame as grid text")
-    previous_frame_text: str = dspy.InputField(desc="Previous frame as grid text (if available)")
-    grid_diff: str = dspy.InputField(desc="What changed between frames")
+    frame_analysis: str = dspy.InputField(desc="Programmatic analysis: objects, colors, regions, sizes, diff from previous frame")
+    screenshot: dspy.Image = dspy.InputField(desc="Screenshot of the current game frame")
     existing_knowledge: str = dspy.InputField(desc="Existing game knowledge base")
 
-    visual_analysis: str = dspy.OutputField(desc="Detailed visual analysis of the current game state")
-    player_position: str = dspy.OutputField(desc="Estimated player position (row, col)")
-    goal_description: str = dspy.OutputField(desc="Description of the apparent goal or target")
+    visual_analysis: str = dspy.OutputField(desc="What do the objects represent? Player, goal, obstacles, UI elements?")
+    player_position: str = dspy.OutputField(desc="Estimated player object position (row, col) and which color/shape it is")
+    goal_description: str = dspy.OutputField(desc="What appears to be the goal or objective")
+    recommended_strategy: str = dspy.OutputField(desc="Recommended next strategy based on visual analysis")
+
+
+class VisualObserverTextSignature(dspy.Signature):
+    """You are a visual observer for an interactive puzzle game (ARC AGI 3).
+    You receive a structured analysis of the grid computed by numpy.
+
+    The frame_analysis already tells you WHAT objects exist and WHERE they are.
+    Your job is to interpret the MEANING: what is the player? What is the goal?
+    What are obstacles? What strategy should we use?
+
+    Be specific about spatial relationships and movement patterns."""
+
+    game_state_summary: str = dspy.InputField(desc="Current game state summary")
+    frame_analysis: str = dspy.InputField(desc="Programmatic analysis: objects, colors, regions, sizes, diff from previous frame")
+    existing_knowledge: str = dspy.InputField(desc="Existing game knowledge base")
+
+    visual_analysis: str = dspy.OutputField(desc="What do the objects represent? Player, goal, obstacles, UI elements?")
+    player_position: str = dspy.OutputField(desc="Estimated player object position (row, col) and which color/shape it is")
+    goal_description: str = dspy.OutputField(desc="What appears to be the goal or objective")
     recommended_strategy: str = dspy.OutputField(desc="Recommended next strategy based on visual analysis")
 
 
 class VisualObserver:
-    """Observes game frames and provides visual analysis."""
+    """Observes game frames and provides visual analysis.
 
-    def __init__(self, lm: dspy.LM):
-        self.predict = dspy.Predict(VisualObserverSignature)
+    Supports two modes:
+    - use_screenshots=True: sends a dspy.Image screenshot (requires multimodal LLM)
+    - use_screenshots=False: sends structured text analysis only
+    """
+
+    def __init__(self, lm: dspy.LM, use_screenshots: bool = True):
         self.lm = lm
+        self.use_screenshots = use_screenshots
+        self.predict_with_image = dspy.Predict(VisualObserverSignature)
+        self.predict_text_only = dspy.Predict(VisualObserverTextSignature)
 
     def observe(self, history: GameHistory) -> dict:
         current_frame = history.last_frame
         if current_frame is None:
             return {"visual_analysis": "No frame available yet."}
 
-        current_text = frame_to_text(current_frame)
-        prev_text = ""
-        diff = "First frame."
-
-        if len(history.steps) >= 2:
-            prev_frame = history.steps[-2].frame
-            prev_text = frame_to_text(prev_frame)
-            diff = history.steps[-1].grid_diff or "Unknown"
+        # Precompute analysis programmatically (numpy, not LLM)
+        prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
+        analysis = analyze_frame(current_frame, prev_frame)
 
         with dspy.context(lm=self.lm):
-            result = self.predict(
-                game_state_summary=history.get_state_summary(),
-                current_frame_text=current_text,
-                previous_frame_text=prev_text or "N/A (first frame)",
-                grid_diff=diff,
-                existing_knowledge=history.get_game_kb_text(),
-            )
+            if self.use_screenshots:
+                screenshot = dspy.Image(url=frame_to_image_bytes(current_frame))
+                result = self.predict_with_image(
+                    game_state_summary=history.get_state_summary(),
+                    frame_analysis=analysis,
+                    screenshot=screenshot,
+                    existing_knowledge=history.get_game_kb_text(),
+                )
+            else:
+                result = self.predict_text_only(
+                    game_state_summary=history.get_state_summary(),
+                    frame_analysis=analysis,
+                    existing_knowledge=history.get_game_kb_text(),
+                )
 
         return {
             "visual_analysis": result.visual_analysis,
@@ -105,7 +136,7 @@ class GameMechanicsObserver:
         # Use RLM for deep analysis when history is large
         self.rlm = dspy.RLM(
             GameMechanicsSignature,
-            max_iterations=10,
+            max_iterations=4,
             sub_lm=self.sub_lm,
         )
         # Use simple predict for early game
@@ -209,7 +240,7 @@ class REPLStrategyObserver:
         self.sub_lm = sub_lm or lm
         self.rlm = dspy.RLM(
             REPLStrategySignature,
-            max_iterations=8,
+            max_iterations=4,
             sub_lm=self.sub_lm,
         )
         self.predict = dspy.Predict(REPLStrategySignature)
