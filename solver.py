@@ -109,24 +109,28 @@ class ExecuteSignature(dspy.Signature):
     You know what the actions do, what the objects are, and what the goal is.
     Now plan and execute efficient action sequences to complete the level.
 
-    Use your knowledge to:
-    1. Identify current position relative to the goal
-    2. Plan the shortest/safest path
-    3. Account for any resource limits (timer, move counter)
-    4. Handle obstacles using known mechanics
+    CRITICAL RULES:
+    1. Look at the 'action_effectiveness' data — if an action is showing tiny/no pixel changes,
+       it is BLOCKED and you must stop using it. Switch to a different action.
+    2. Different actions may affect different parts of the grid. When one group of objects
+       reaches a boundary, only actions that affect the REMAINING objects will make progress.
+    3. Check the frame_analysis for object positions. If an object's column is near the
+       right edge (>50), it may be close to a boundary or target.
+    4. The goal is typically to move a specific object (e.g., a colored bar) to reach
+       a target position (e.g., a cyan marker).
 
     Be EFFICIENT. Every wasted action may cost a resource.
-    If you get stuck or something unexpected happens, say so in your reasoning."""
+    If an action suddenly produces tiny changes, STOP using it immediately."""
 
     frame_analysis: str = dspy.InputField(desc="Programmatic analysis: objects, positions, confirmed mechanics context")
     game_state: str = dspy.InputField(desc="Game state with level info and knowledge")
-    confirmed_mechanics: str = dspy.InputField(desc="Confirmed game mechanics and rules")
+    confirmed_mechanics: str = dspy.InputField(desc="Confirmed game mechanics and rules, including which actions are BLOCKED")
     visual_analysis: str = dspy.InputField(desc="Visual observer's spatial analysis")
     solver_directives: str = dspy.InputField(desc="Dynamic solver directives from optimizer")
     available_actions: str = dspy.InputField(desc="Available actions")
 
-    plan: str = dspy.OutputField(desc="Step-by-step plan: where am I, where's the goal, what's the path")
-    actions: str = dspy.OutputField(desc='JSON list of 3-8 precise goal-directed actions')
+    plan: str = dspy.OutputField(desc="Step-by-step plan: which actions are working, which are blocked, what to do next")
+    actions: str = dspy.OutputField(desc='JSON list of 3-8 precise goal-directed actions. NEVER use actions that are BLOCKED.')
 
 
 # ── Phase-aware Solver ─────────────────────────────────────────────
@@ -139,12 +143,12 @@ class Solver:
     Uses fast CoT for the execute phase where we need speed.
     """
 
-    # Phase transition thresholds
-    EXPLORE_MIN_STEPS = 8        # Minimum steps before leaving EXPLORE
-    EXPLORE_MAX_STEPS = 40       # Force transition to HYPOTHESIZE
-    ITERATE_MAX_ROUNDS = 5       # Max hypothesis test rounds before EXECUTE
-    HIGH_CONFIDENCE = 85         # Hypothesis confidence to count as "confirmed"
-    MECHANICS_TO_EXECUTE = 2     # Confirmed mechanics needed to enter EXECUTE
+    # Phase transition thresholds (counted in BATCHES, not individual actions)
+    EXPLORE_MIN_BATCHES = 2      # Minimum batches before leaving EXPLORE
+    EXPLORE_MAX_BATCHES = 6      # Force transition to HYPOTHESIZE
+    ITERATE_MAX_ROUNDS = 3       # Max hypothesis test rounds before EXECUTE
+    HIGH_CONFIDENCE = 80         # Hypothesis confidence to count as "confirmed"
+    MECHANICS_TO_EXECUTE = 1     # Confirmed mechanics needed to enter EXECUTE
 
     def __init__(self, lm: dspy.LM, sub_lm: Optional[dspy.LM] = None,
                  available_actions: Optional[list[str]] = None):
@@ -159,6 +163,7 @@ class Solver:
 
         # Knowledge accumulated across phases
         self.action_effects: dict[str, list[str]] = {a: [] for a in self.available_actions}
+        self.action_effectiveness: dict[str, dict] = {}  # action -> {productive, tiny, total}
         self.hypotheses: list[dict] = []
         self.confirmed_mechanics: list[dict] = []
 
@@ -226,6 +231,16 @@ class Solver:
 
     def _explore(self, history: GameHistory) -> list[str]:
         """EXPLORE: Systematically try every action, maximize information gain."""
+        # First batch: deterministic — try each action once to get baseline effects
+        untested = [a for a in self.available_actions if not self.action_effects.get(a)]
+        if untested:
+            # Try untested actions first, then repeat each action to confirm
+            batch = list(untested)
+            # Add a second round to see if effects are consistent
+            batch.extend(untested)
+            return batch[:12]
+
+        # Subsequent batches: use LLM to design experiments based on observations
         effects_text = self._format_action_effects()
         actions_desc = ", ".join(self.available_actions)
         prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
@@ -253,23 +268,78 @@ class Solver:
         prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
         analysis = analyze_frame(history.last_frame, prev_frame)
 
+        # Include action effects summary and any existing solver instructions
+        enriched_log = self._format_action_effects() + "\n\n" + exploration_log
+        if history.solver_instructions:
+            enriched_log += f"\n\nOptimizer notes:\n{history.solver_instructions[:500]}"
+
         result = self.hypothesizer(
             frame_analysis=analysis,
             game_state=history.get_state_summary(),
-            exploration_log=exploration_log,
+            exploration_log=enriched_log,
             available_actions=actions_desc,
         )
 
-        # Parse hypotheses
+        # Parse hypotheses — try JSON first, then extract from text
+        parsed_ok = False
         try:
-            parsed = json.loads(result.hypotheses)
+            # Try to extract JSON from the response (may be wrapped in markdown)
+            hyp_text = result.hypotheses
+            # Strip markdown code fences if present
+            if "```" in hyp_text:
+                import re
+                json_match = re.search(r'```(?:json)?\s*([\s\S]*?)```', hyp_text)
+                if json_match:
+                    hyp_text = json_match.group(1).strip()
+
+            parsed = json.loads(hyp_text)
             if isinstance(parsed, list):
                 self.hypotheses = parsed
-                print(f"  [Hypothesize] {len(self.hypotheses)} hypotheses formed:")
-                for h in self.hypotheses[:3]:
-                    print(f"    [{h.get('confidence', '?')}%] {h.get('mechanic', '?')}: {h.get('description', '?')[:70]}")
+                parsed_ok = True
         except (json.JSONDecodeError, TypeError):
-            print(f"  [Hypothesize] Could not parse hypotheses, keeping existing")
+            pass
+
+        if not parsed_ok:
+            # Fallback: create hypotheses by analyzing action effects programmatically
+            self.hypotheses = []
+            import re
+
+            # Group actions by their effect regions
+            row_groups = {}  # row_range -> list of actions
+            for action, effects in self.action_effects.items():
+                if not effects:
+                    continue
+                # Extract row ranges from effects
+                for e in effects:
+                    m = re.search(r"rows (\d+)-(\d+)", e)
+                    if m:
+                        row_range = f"rows {m.group(1)}-{m.group(2)}"
+                        row_groups.setdefault(row_range, []).append(action)
+                        break
+
+                self.hypotheses.append({
+                    "mechanic": f"{action}_movement",
+                    "description": f"{action} shifts objects in {effects[-1][:120]}",
+                    "confidence": 70,
+                    "test": f"Repeat {action} and check column progression"
+                })
+
+            # Add grouping hypothesis if actions affect different row ranges
+            if len(row_groups) > 1:
+                groups_desc = "; ".join(f"{k}: {', '.join(set(v))}" for k, v in row_groups.items())
+                self.hypotheses.insert(0, {
+                    "mechanic": "action_row_groups",
+                    "description": f"Actions affect DIFFERENT row ranges: {groups_desc}",
+                    "confidence": 85,
+                    "test": "Compare row ranges when different actions are at same column position"
+                })
+
+            print(f"  [Hypothesize] JSON parse failed, built {len(self.hypotheses)} hypotheses from action effects")
+
+        if self.hypotheses:
+            print(f"  [Hypothesize] {len(self.hypotheses)} hypotheses formed:")
+            for h in self.hypotheses[:3]:
+                print(f"    [{h.get('confidence', '?')}%] {h.get('mechanic', '?')}: {h.get('description', '?')[:70]}")
 
         # Transition to ITERATE after forming hypotheses
         self._transition_to(SolverPhase.ITERATE)
@@ -327,7 +397,11 @@ class Solver:
 
         solver_directives = history.solver_instructions or "Execute efficiently using confirmed mechanics."
 
+        # Combine confirmed mechanics with optimizer instructions (which may be more detailed)
         mechanics_text = self._format_confirmed_mechanics()
+        if history.solver_instructions:
+            mechanics_text += f"\n\n--- Optimizer Strategy ---\n{history.solver_instructions[:800]}"
+
         prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
         analysis = analyze_frame(history.last_frame, prev_frame)
 
@@ -342,26 +416,27 @@ class Solver:
 
         actions = self._parse_batch_actions(result.actions)
 
-        # Inject diversity if all-same
-        if len(actions) >= 5 and len(set(actions)) == 1:
-            actions = self._inject_exploration(actions)
-
+        # Don't inject diversity in EXECUTE — trust the plan
         return actions
 
     # ── Phase transition logic ──
 
     def _check_phase_transitions(self, history: GameHistory):
-        """Auto-advance phases based on step counts and knowledge."""
-        if self.phase == SolverPhase.EXPLORE:
-            # Enough exploration? Check if we have effects for most actions
-            actions_with_data = sum(1 for effects in self.action_effects.values() if len(effects) >= 2)
-            has_enough_data = actions_with_data >= len(self.available_actions) * 0.7
+        """Auto-advance phases based on batch counts and knowledge.
 
-            if self.phase_step_count >= self.EXPLORE_MAX_STEPS:
-                print(f"  [Phase] EXPLORE max steps reached, forcing HYPOTHESIZE")
+        phase_step_count tracks BATCHES (solve_step calls), not individual actions.
+        Each batch typically produces 4-8 actions.
+        """
+        if self.phase == SolverPhase.EXPLORE:
+            # Check if we have at least 1 observed effect for each action
+            actions_with_data = sum(1 for effects in self.action_effects.values() if len(effects) >= 1)
+            all_tested = actions_with_data >= len(self.available_actions)
+
+            if self.phase_step_count >= self.EXPLORE_MAX_BATCHES:
+                print(f"  [Phase] EXPLORE max batches reached, forcing HYPOTHESIZE")
                 self._transition_to(SolverPhase.HYPOTHESIZE)
-            elif self.phase_step_count >= self.EXPLORE_MIN_STEPS and has_enough_data:
-                print(f"  [Phase] Enough exploration data ({actions_with_data}/{len(self.available_actions)} actions tested), moving to HYPOTHESIZE")
+            elif self.phase_step_count >= self.EXPLORE_MIN_BATCHES and all_tested:
+                print(f"  [Phase] All {actions_with_data} actions tested after {self.phase_step_count} batches, moving to HYPOTHESIZE")
                 self._transition_to(SolverPhase.HYPOTHESIZE)
 
         elif self.phase == SolverPhase.ITERATE:
@@ -384,28 +459,61 @@ class Solver:
         print(f"  [Phase] Level transition detected, resetting to EXPLORE")
         self._transition_to(SolverPhase.EXPLORE)
         self.action_effects = {a: [] for a in self.available_actions}
+        self.action_effectiveness = {}
         self.hypotheses = []
         # Keep confirmed_mechanics — some may carry over between levels
 
     # ── Knowledge tracking ──
 
     def _update_action_effects(self, history: GameHistory):
-        """Extract action-effect pairs from recent history."""
-        for step in history.steps[-10:]:
+        """Extract action-effect pairs from recent history with rich diff info."""
+        import re
+        for step in history.steps[-20:]:
             if step.action == "RESET" or not step.grid_diff:
                 continue
             action = step.action.split("(")[0]  # Strip coords from ACTION6(x,y)
-            if action in self.action_effects:
-                effect = step.grid_diff[:100]
-                # Keep only last 5 effects per action to stay current
-                effects = self.action_effects[action]
-                if len(effects) >= 5:
-                    effects.pop(0)
-                if effect not in effects:
-                    effects.append(effect)
+            if action not in self.action_effects:
+                continue
+
+            # Build a richer effect description including step number
+            effect = f"step{step.step_number}: {step.grid_diff[:150]}"
+
+            # Keep only last 3 effects per action to stay current
+            effects = self.action_effects[action]
+            if len(effects) >= 3:
+                effects.pop(0)
+            # Avoid exact duplicates but allow similar effects (different steps)
+            if not any(step.grid_diff[:80] in e for e in effects):
+                effects.append(effect)
+
+        # Update action effectiveness tracking — detect when actions become ineffective
+        self._update_action_effectiveness(history)
+
+    def _update_action_effectiveness(self, history: GameHistory):
+        """Track which actions are producing useful changes vs. being blocked.
+        Recalculates from scratch each time using the last 15 steps."""
+        import re
+        self.action_effectiveness = {}
+        recent = history.steps[-15:]
+        for step in recent:
+            if step.action == "RESET" or not step.grid_diff:
+                continue
+            action = step.action.split("(")[0]
+            px_match = re.search(r"(\d+) pixels changed", step.grid_diff)
+            px = int(px_match.group(1)) if px_match else 0
+
+            if action not in self.action_effectiveness:
+                self.action_effectiveness[action] = {"productive": 0, "tiny": 0, "total": 0}
+
+            stats = self.action_effectiveness[action]
+            stats["total"] += 1
+            if px <= 4:
+                stats["tiny"] += 1
+            elif px < 1000:  # Normal movement, not a reset
+                stats["productive"] += 1
 
     def _format_action_effects(self) -> str:
-        """Format known action effects for prompts."""
+        """Format known action effects for prompts, including effectiveness warnings."""
         lines = []
         for action in sorted(self.action_effects.keys()):
             effects = self.action_effects[action]
@@ -413,22 +521,40 @@ class Solver:
                 lines.append(f"{action}: {'; '.join(effects)}")
             else:
                 lines.append(f"{action}: NOT YET TESTED")
+
+        # Add effectiveness warnings
+        warnings = []
+        for action, stats in self.action_effectiveness.items():
+            if stats["total"] >= 3 and stats["tiny"] > stats["productive"]:
+                warnings.append(f"WARNING: {action} is mostly producing tiny/no changes — it may be BLOCKED")
+        if warnings:
+            lines.append("\n" + "\n".join(warnings))
+
         return "\n".join(lines)
 
     def _format_confirmed_mechanics(self) -> str:
-        """Format confirmed mechanics for the execute phase."""
-        if not self.confirmed_mechanics:
-            # Fall back to hypotheses if nothing confirmed yet
-            if self.hypotheses:
-                return "Unconfirmed hypotheses:\n" + "\n".join(
-                    f"  [{h.get('confidence', '?')}%] {h.get('mechanic', '?')}: {h.get('description', '?')}"
-                    for h in self.hypotheses
-                )
-            return "No mechanics confirmed yet. Explore and observe."
+        """Format confirmed mechanics for the execute phase, including effectiveness data."""
+        lines = []
 
-        lines = ["Confirmed mechanics:"]
-        for m in self.confirmed_mechanics:
-            lines.append(f"  [{m.get('confidence', '?')}%] {m.get('mechanic', '?')}: {m.get('description', '?')}")
+        if self.confirmed_mechanics:
+            lines.append("Confirmed mechanics:")
+            for m in self.confirmed_mechanics:
+                lines.append(f"  [{m.get('confidence', '?')}%] {m.get('mechanic', '?')}: {m.get('description', '?')}")
+        elif self.hypotheses:
+            lines.append("Unconfirmed hypotheses:")
+            for h in self.hypotheses:
+                lines.append(f"  [{h.get('confidence', '?')}%] {h.get('mechanic', '?')}: {h.get('description', '?')}")
+        else:
+            lines.append("No mechanics confirmed yet. Explore and observe.")
+
+        # Add action effectiveness data
+        if self.action_effectiveness:
+            lines.append("\nAction effectiveness (recent):")
+            for action in sorted(self.action_effectiveness.keys()):
+                stats = self.action_effectiveness[action]
+                status = "WORKING" if stats["productive"] > stats["tiny"] else "BLOCKED/WEAK"
+                lines.append(f"  {action}: {stats['productive']} productive, {stats['tiny']} tiny/blocked out of {stats['total']} total -> {status}")
+
         return "\n".join(lines)
 
     # ── Utility methods ──

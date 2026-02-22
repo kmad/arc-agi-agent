@@ -16,5 +16,8 @@ api_key
 # Game files (downloaded at runtime)
 environment_files/
 
+# Knowledge base (persisted across runs, not source)
+knowledge_base/
+
 # OS
 .DS_Store

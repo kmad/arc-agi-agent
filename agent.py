@@ -126,6 +126,7 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
         print(f"[Solver] {len(actions)} actions in {elapsed:.1f}s: {actions}")
 
         # --- Execute actions ---
+        consecutive_tiny = 0  # Track degraded actions within a batch
         for action_str in actions:
             if move_count >= max_steps:
                 break
@@ -170,6 +171,22 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
                 print(f"  #{move_count} {action_str} -> no change")
             else:
                 print(f"  #{move_count} {action_str} -> {diff[:60]}")
+
+            # Track if actions are degrading (tiny changes = likely stuck/blocked)
+            import re
+            px_match = re.search(r"(\d+) pixels changed", diff)
+            px_changed = int(px_match.group(1)) if px_match else 0
+            if diff == "No change." or px_changed <= 4:
+                consecutive_tiny += 1
+            else:
+                consecutive_tiny = 0
+
+            # Abort batch early if 4+ consecutive tiny/no changes
+            if consecutive_tiny >= 4:
+                remaining = len(actions) - actions.index(action_str) - 1
+                if remaining > 0:
+                    print(f"  [Abort] {consecutive_tiny} consecutive tiny changes, aborting {remaining} remaining actions")
+                break
 
             # --- Level transition detection ---
             transition = history.detect_level_transition(

@@ -66,22 +66,8 @@ class GameHistory:
             if step.action == "RESET":
                 continue
             diff = step.grid_diff or "?"
-            # Classify the diff by impact
-            if "No change" in diff:
-                impact = "NO_EFFECT"
-            elif "pixels changed" in diff:
-                import re
-                m = re.search(r"(\d+) pixels changed", diff)
-                px = int(m.group(1)) if m else 0
-                if px <= 4:
-                    impact = "TINY (progress bar only)"
-                elif px <= 60:
-                    impact = "MEDIUM (player moved)"
-                else:
-                    impact = "LARGE (screen transition)"
-            else:
-                impact = "UNKNOWN"
-            lines.append(f"  Step {step.step_number}: {step.action} -> {impact} | {diff[:80]}")
+            # Include the full diff info (now includes directional shift data)
+            lines.append(f"  Step {step.step_number}: {step.action} -> {diff[:150]}")
         return "\n".join(lines) if lines else "No history yet."
 
     def is_stuck(self, window: int = 10) -> tuple[bool, str]:
@@ -353,18 +339,33 @@ def compute_grid_diff(prev: np.ndarray, curr: np.ndarray) -> str:
         return "No change."
     changed_positions = np.argwhere(diff)
     n_changed = len(changed_positions)
-    summary = f"{n_changed} pixels changed."
+
     if n_changed <= 30:
         details = []
         for pos in changed_positions:
             r, c = pos
             details.append(f"({r},{c}): {prev[r, c]}->{curr[r, c]}")
-        summary += " " + "; ".join(details)
-    else:
-        # Show bounding box of changes
-        min_r, min_c = changed_positions.min(axis=0)
-        max_r, max_c = changed_positions.max(axis=0)
-        summary += f" Region: rows {min_r}-{max_r}, cols {min_c}-{max_c}"
+        return f"{n_changed} pixels changed. " + "; ".join(details)
+
+    # Show bounding box of changes
+    min_r, min_c = changed_positions.min(axis=0)
+    max_r, max_c = changed_positions.max(axis=0)
+    summary = f"{n_changed} pixels changed. Region: rows {min_r}-{max_r}, cols {min_c}-{max_c}"
+
+    # Add directional shift info: detect if objects moved left/right/up/down
+    # by checking which rows have changes and the column shift pattern
+    changed_rows = np.unique(changed_positions[:, 0])
+    row_span = f"rows {changed_rows[0]}-{changed_rows[-1]}" if len(changed_rows) > 1 else f"row {changed_rows[0]}"
+
+    # Check for consistent column shift (objects sliding)
+    old_vals = prev[diff]
+    new_vals = curr[diff]
+    # Find columns that gained/lost pixels
+    col_changes = changed_positions[:, 1]
+    left_edge = col_changes.min()
+    right_edge = col_changes.max()
+    summary += f". Affected {row_span}, cols {left_edge}-{right_edge}"
+
     return summary
 
 
