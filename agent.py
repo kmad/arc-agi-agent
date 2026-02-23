@@ -161,6 +161,7 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
 
     # === Initialize agents ===
     solver = Solver(lm=main_lm, sub_lm=mini_lm, available_actions=action_names)
+    print(f"  Traces: {solver.trace_path}")
     visual_observer = VisualObserver(lm=main_lm, use_screenshots=False)
     mechanics_observer = GameMechanicsObserver(lm=main_lm, sub_lm=mini_lm, action_desc=action_desc)
     repl_observer = REPLStrategyObserver(lm=main_lm, sub_lm=mini_lm)

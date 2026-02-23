@@ -15,7 +15,9 @@ Phases:
 import dspy
 import io
 import json
+import os
 import numpy as np
+import time
 from enum import Enum
 from typing import Optional
 from game_state import GameHistory, frame_to_text, compute_grid_diff, frame_to_dspy_image
@@ -203,6 +205,12 @@ class Solver:
 
         self.call_count = 0
 
+        # Trace logging
+        os.makedirs("traces", exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        self.trace_path = f"traces/{ts}.jsonl"
+        self._trace_file = open(self.trace_path, "a")
+
     def solve_step(self, history: GameHistory, visual_obs: dict, deep: bool = False) -> list[str]:
         """Route to the appropriate phase handler."""
         self.call_count += 1
@@ -267,6 +275,59 @@ class Solver:
         # Empty fallback
         return dspy.DataFrame(pd.DataFrame(columns=['action', 'pixels_changed', 'direction', 'blocked', 'effective']))
 
+    def _log_trace(self, phase: str, result, actions: list[str], history: GameHistory):
+        """Log solver reasoning to traces/ JSONL and print a condensed summary."""
+        reasoning = {}
+
+        # DSPy Prediction objects store fields as attributes; discover them
+        # by checking known output field names and the result's keys
+        result_keys = set()
+        if hasattr(result, 'keys'):
+            result_keys = set(result.keys())
+        # Also check the signature's output fields if available
+        sig = getattr(result, '_signature', None) or getattr(type(result), 'signature', None)
+        if sig and hasattr(sig, 'output_fields'):
+            result_keys |= set(sig.output_fields.keys())
+
+        for field_name in result_keys:
+            if field_name == "actions":
+                continue
+            val = getattr(result, field_name, None)
+            if val is None:
+                continue
+            if isinstance(val, list):
+                reasoning[field_name] = [
+                    item.model_dump() if hasattr(item, 'model_dump') else str(item)
+                    for item in val
+                ]
+            else:
+                reasoning[field_name] = str(val)
+
+        # Grab CoT rationale if present
+        rationale = getattr(result, 'rationale', None) or getattr(result, 'reasoning', None)
+        if rationale:
+            reasoning["rationale"] = str(rationale)
+
+        entry = {
+            "ts": time.time(),
+            "batch": self.call_count,
+            "phase": phase,
+            "step": history.current_step,
+            "levels": history.levels_completed,
+            "actions": actions,
+            "reasoning": reasoning,
+        }
+
+        self._trace_file.write(json.dumps(entry, default=str) + "\n")
+        self._trace_file.flush()
+
+        # Print condensed reasoning to stdout
+        for key, val in reasoning.items():
+            text = str(val)
+            if len(text) > 300:
+                text = text[:300] + "..."
+            print(f"  [{phase}] {key}: {text}")
+
     # ── Phase handlers ──
 
     def _explore(self, history: GameHistory) -> list[str]:
@@ -298,6 +359,7 @@ class Solver:
         )
 
         actions = self._validate_actions(result.actions)
+        self._log_trace("EXPLORE", result, actions, history)
 
         # Ensure exploration diversity: if parsed actions lack variety, force it
         if len(set(actions)) < min(3, len(self.available_actions)):
@@ -326,6 +388,8 @@ class Solver:
             available_actions=actions_desc,
         )
 
+        actions = self._validate_actions(result.actions)
+
         # DSPy parses Pydantic natively — result.hypotheses is list[GameHypothesis]
         if result.hypotheses and isinstance(result.hypotheses, list):
             self.hypotheses = self._coerce_hypotheses(result.hypotheses)
@@ -334,15 +398,12 @@ class Solver:
             self.hypotheses = self._build_fallback_hypotheses()
             print(f"  [Hypothesize] Built {len(self.hypotheses)} fallback hypotheses from action effects")
 
-        if self.hypotheses:
-            print(f"  [Hypothesize] {len(self.hypotheses)} hypotheses formed:")
-            for h in self.hypotheses[:3]:
-                print(f"    [{h.confidence}%] {h.mechanic}: {h.description[:70]}")
+        self._log_trace("HYPOTHESIZE", result, actions, history)
 
         # Transition to ITERATE after forming hypotheses
         self._transition_to(SolverPhase.ITERATE)
 
-        return self._validate_actions(result.actions)
+        return actions
 
     def _iterate(self, history: GameHistory) -> list[str]:
         """ITERATE: Test hypotheses with targeted experiments."""
@@ -364,6 +425,8 @@ class Solver:
             available_actions=actions_desc,
         )
 
+        actions = self._validate_actions(result.actions)
+
         # DSPy parses Pydantic natively — result.updated_hypotheses is list[GameHypothesis]
         if result.updated_hypotheses and isinstance(result.updated_hypotheses, list):
             self.hypotheses = self._coerce_hypotheses(result.updated_hypotheses)
@@ -375,13 +438,15 @@ class Solver:
                         self.confirmed_mechanics.append(h)
                         print(f"  [Iterate] CONFIRMED: {h.mechanic}: {h.description[:60]}")
 
+        self._log_trace("ITERATE", result, actions, history)
+
         # Check if ready to execute
         phase_rec = result.phase_recommendation if hasattr(result, 'phase_recommendation') else ""
         if "ready_to_execute" in phase_rec.lower() or len(self.confirmed_mechanics) >= self.MECHANICS_TO_EXECUTE:
             print(f"  [Iterate] {len(self.confirmed_mechanics)} mechanics confirmed, transitioning to EXECUTE")
             self._transition_to(SolverPhase.EXECUTE)
 
-        return self._validate_actions(result.actions)
+        return actions
 
     def _execute(self, history: GameHistory, visual_obs: dict = None) -> list[str]:
         """EXECUTE: Fast goal-directed play using confirmed mechanics."""
@@ -407,6 +472,7 @@ class Solver:
         )
 
         actions = self._validate_actions(result.actions)
+        self._log_trace("EXECUTE", result, actions, history)
 
         # Post-filter: remove blocked actions from the batch
         if effective_actions and len(effective_actions) < len(self.available_actions):
