@@ -23,6 +23,16 @@ RLM_BATCH_SIZE = 5  # Number of moves between reflection cycles
 DEFAULT_GAME = "ls20"
 MAX_STEPS = 500
 
+# Multi-agent orchestrator settings
+NUM_AGENTS = 4
+SYNC_INTERVAL_SECONDS = 60
+ORCHESTRATOR_MODE = "local"  # "local" or "sandbox"
+DAYTONA_API_KEY = os.getenv("DAYTONA_API_KEY", "")
+
+# Strategic Reasoner settings
+STRATEGIC_REASONER_ENABLED = True
+STRATEGIC_REASONER_MAX_ITERATIONS = 8
+
 # Color map for ARC grids (index -> name)
 # Default action labels for display (game-agnostic)
 DEFAULT_ACTION_LABELS = {

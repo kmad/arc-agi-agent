@@ -7,6 +7,12 @@ from typing import Optional
 import json
 import io
 
+from models import (
+    KnowledgeEntry, REPLTip, KnowledgeCategory, REPLCategory,
+    FrameAnalysis, ColorRegion, MovementDirection, AgentReport, AgentStatus,
+    AgentDirective,
+)
+
 # Directory for persisting knowledge between runs
 KB_DIR = "knowledge_base"
 
@@ -27,11 +33,14 @@ class GameHistory:
     """Full game history and knowledge bases."""
     game_id: str
     steps: list[StepRecord] = field(default_factory=list)
-    game_knowledge_base: list[dict] = field(default_factory=list)
-    repl_knowledge_base: list[dict] = field(default_factory=list)
+    game_knowledge_base: list[KnowledgeEntry] = field(default_factory=list)
+    repl_knowledge_base: list[REPLTip] = field(default_factory=list)
     solver_instructions: str = ""
     total_levels: int = 0
     levels_completed: int = 0
+
+    # Active directive from orchestrator's StrategicReasoner
+    active_directive: Optional[AgentDirective] = None
 
     # Per-level tracking
     level_knowledge: dict[int, list[dict]] = field(default_factory=dict)
@@ -174,6 +183,14 @@ class GameHistory:
         if level_kb:
             lines.append(f"Level {current_level} knowledge: {len(level_kb)} entries")
 
+        # Add active directive info
+        if self.active_directive:
+            lines.append(f"Directive: FOCUS on '{self.active_directive.focus_area}'")
+            if self.active_directive.avoid:
+                lines.append(f"  AVOID: {', '.join(self.active_directive.avoid)}")
+            if self.active_directive.try_actions:
+                lines.append(f"  TRY: {', '.join(self.active_directive.try_actions)}")
+
         if self.steps:
             recent = self.get_recent_actions(10)
             lines.append(f"Recent actions: {', '.join(recent)}")
@@ -191,11 +208,7 @@ class GameHistory:
             return "No game knowledge accumulated yet."
         entries = []
         for entry in self.game_knowledge_base:
-            confidence = entry.get("confidence", "?")
-            category = entry.get("category", "observation")
-            text = entry.get("text", "")
-            source = entry.get("source", "unknown")
-            entries.append(f"[{confidence}%] [{category}] {text} (source: {source}, step {entry.get('step', '?')})")
+            entries.append(f"[{entry.confidence}%] [{entry.category.value}] {entry.text} (source: {entry.source}, step {entry.step})")
         return "\n".join(entries)
 
     def get_repl_kb_text(self) -> str:
@@ -204,9 +217,7 @@ class GameHistory:
             return "No REPL knowledge accumulated yet."
         entries = []
         for entry in self.repl_knowledge_base:
-            category = entry.get("category", "tip")
-            text = entry.get("text", "")
-            entries.append(f"[{category}] {text}")
+            entries.append(f"[{entry.category.value}] {entry.text}")
         return "\n".join(entries)
 
     def save_knowledge(self):
@@ -215,8 +226,8 @@ class GameHistory:
         kb_path = os.path.join(KB_DIR, f"{self.game_id}.json")
         data = {
             "game_id": self.game_id,
-            "game_knowledge_base": self.game_knowledge_base,
-            "repl_knowledge_base": self.repl_knowledge_base,
+            "game_knowledge_base": [e.model_dump() for e in self.game_knowledge_base],
+            "repl_knowledge_base": [e.model_dump() for e in self.repl_knowledge_base],
             "solver_instructions": self.solver_instructions,
             "total_steps": self.current_step,
             "levels_completed": self.levels_completed,
@@ -235,26 +246,80 @@ class GameHistory:
         try:
             with open(kb_path) as f:
                 data = json.load(f)
-            self.game_knowledge_base = data.get("game_knowledge_base", [])
-            self.repl_knowledge_base = data.get("repl_knowledge_base", [])
+            # Load typed knowledge entries, with fallback for legacy dict format
+            raw_game_kb = data.get("game_knowledge_base", [])
+            self.game_knowledge_base = [
+                KnowledgeEntry.model_validate(e) if isinstance(e, dict) else e
+                for e in raw_game_kb
+            ]
+            raw_repl_kb = data.get("repl_knowledge_base", [])
+            self.repl_knowledge_base = [
+                REPLTip.model_validate(e) if isinstance(e, dict) else e
+                for e in raw_repl_kb
+            ]
             self.solver_instructions = data.get("solver_instructions", "")
             # Load level-specific data
             self.level_knowledge = {int(k): v for k, v in data.get("level_knowledge", {}).items()}
             self.level_attempts = {int(k): v for k, v in data.get("level_attempts", {}).items()}
             self.level_best_actions = {int(k): v for k, v in data.get("level_best_actions", {}).items()}
             return True
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, KeyError, Exception):
             return False
 
+    def apply_directive(self, directive: AgentDirective):
+        """Apply an orchestrator directive to guide this agent's behavior."""
+        self.active_directive = directive
+        # Inject directive-specific knowledge
+        if directive.knowledge_to_inject:
+            self.inject_knowledge(directive.knowledge_to_inject)
+        # Override instructions if provided
+        if directive.updated_instructions:
+            self.solver_instructions = directive.updated_instructions
 
-def analyze_frame(frame: np.ndarray, prev_frame: np.ndarray = None) -> str:
+    def inject_knowledge(self, knowledge: list[KnowledgeEntry], repl_tips: list[REPLTip] | None = None):
+        """Inject externally-provided knowledge (e.g., from orchestrator merge)."""
+        existing_fps = {e.fingerprint for e in self.game_knowledge_base if e.fingerprint}
+        for entry in knowledge:
+            if not entry.fingerprint:
+                entry.compute_fingerprint()
+            if entry.fingerprint not in existing_fps:
+                self.game_knowledge_base.append(entry)
+                existing_fps.add(entry.fingerprint)
+        if repl_tips:
+            existing_texts = {t.text for t in self.repl_knowledge_base}
+            for tip in repl_tips:
+                if tip.text not in existing_texts:
+                    self.repl_knowledge_base.append(tip)
+
+    def export_report(self, agent_id: str = "agent_0") -> AgentReport:
+        """Export an AgentReport for orchestrator sync."""
+        return AgentReport(
+            agent_id=agent_id,
+            game_id=self.game_id,
+            status=AgentStatus.RUNNING,
+            steps_taken=self.current_step,
+            levels_completed=self.levels_completed,
+            total_levels=self.total_levels,
+            knowledge=list(self.game_knowledge_base),
+            repl_tips=list(self.repl_knowledge_base),
+            instructions=self.solver_instructions,
+        )
+
+
+def analyze_frame(frame: np.ndarray, prev_frame: np.ndarray = None, structured: bool = False) -> str | FrameAnalysis:
     """Programmatic frame analysis: extracts objects, colors, regions, diffs.
 
-    Returns a structured text summary that replaces sending the raw grid to the LLM.
-    The LLM interprets meaning; numpy does the pixel math.
+    Args:
+        frame: Current 64x64 game frame.
+        prev_frame: Previous frame for diff computation.
+        structured: If True, return a FrameAnalysis model. If False, return text (backward compat).
+
+    Returns:
+        Text summary (default) or FrameAnalysis model.
     """
     from config import COLOR_MAP
     lines = []
+    regions = []
 
     # 1. Grid overview
     unique_vals = np.unique(frame)
@@ -266,17 +331,18 @@ def analyze_frame(frame: np.ndarray, prev_frame: np.ndarray = None) -> str:
     # Find the most common color as potential background
     vals, counts = np.unique(frame, return_counts=True)
     bg_color = vals[counts.argmax()]
-    lines.append(f"Background: {bg_color}={COLOR_MAP.get(int(bg_color), '?')} ({counts.max()} pixels, {counts.max()*100//frame.size}%)")
+    bg_name = COLOR_MAP.get(int(bg_color), '?')
+    lines.append(f"Background: {bg_color}={bg_name} ({counts.max()} pixels, {counts.max()*100//frame.size}%)")
 
     # 3. Per-color region summary
     for val in unique_vals:
         if val == bg_color:
             continue
         mask = frame == val
-        pixel_count = mask.sum()
+        pixel_count = int(mask.sum())
         positions = np.argwhere(mask)
-        min_r, min_c = positions.min(axis=0)
-        max_r, max_c = positions.max(axis=0)
+        min_r, min_c = int(positions.min(axis=0)[0]), int(positions.min(axis=0)[1])
+        max_r, max_c = int(positions.max(axis=0)[0]), int(positions.max(axis=0)[1])
         height = max_r - min_r + 1
         width = max_c - min_c + 1
         color_name = COLOR_MAP.get(int(val), f"color{val}")
@@ -298,21 +364,36 @@ def analyze_frame(frame: np.ndarray, prev_frame: np.ndarray = None) -> str:
         else:
             shape = "irregular shape"
 
+        regions.append(ColorRegion(
+            color_value=int(val),
+            color_name=color_name,
+            pixel_count=pixel_count,
+            bounding_box=(min_r, min_c, max_r, max_c),
+            shape=shape,
+            fill_ratio=fill_ratio,
+        ))
+
         lines.append(
             f"  {val}={color_name}: {pixel_count}px, rows {min_r}-{max_r} cols {min_c}-{max_c} "
             f"({height}x{width}), {shape}, fill={fill_ratio:.0%}"
         )
 
     # 4. Frame diff (if previous frame provided)
+    movement = None
+    pixels_changed = 0
+    change_region = None
+
     if prev_frame is not None:
         diff_mask = frame != prev_frame
-        n_changed = diff_mask.sum()
+        n_changed = int(diff_mask.sum())
+        pixels_changed = n_changed
         if n_changed == 0:
             lines.append("Diff: No change from previous frame.")
         else:
             changed_pos = np.argwhere(diff_mask)
-            min_r, min_c = changed_pos.min(axis=0)
-            max_r, max_c = changed_pos.max(axis=0)
+            min_r, min_c = int(changed_pos.min(axis=0)[0]), int(changed_pos.min(axis=0)[1])
+            max_r, max_c = int(changed_pos.max(axis=0)[0]), int(changed_pos.max(axis=0)[1])
+            change_region = (min_r, min_c, max_r, max_c)
             lines.append(f"Diff: {n_changed} pixels changed, region rows {min_r}-{max_r} cols {min_c}-{max_c}")
 
             # What colors changed to what
@@ -328,8 +409,6 @@ def analyze_frame(frame: np.ndarray, prev_frame: np.ndarray = None) -> str:
                 lines.append(f"    {old_name}->{new_name}: {count}px")
 
             # Detect movement direction from diff pattern
-            # New pixels appearing (were background, now object) = destination
-            # Old pixels disappearing (were object, now background) = source
             new_positions = np.argwhere((prev_frame == bg_color) & (frame != bg_color))
             old_positions = np.argwhere((prev_frame != bg_color) & (frame == bg_color))
             if len(new_positions) > 0 and len(old_positions) > 0:
@@ -343,9 +422,27 @@ def analyze_frame(frame: np.ndarray, prev_frame: np.ndarray = None) -> str:
                 if abs(dc) > 1:
                     direction.append("RIGHT" if dc > 0 else "LEFT")
                 if direction:
+                    # Use the primary (largest magnitude) direction
+                    if abs(dr) >= abs(dc) and abs(dr) > 1:
+                        movement = MovementDirection.DOWN if dr > 0 else MovementDirection.UP
+                    elif abs(dc) > 1:
+                        movement = MovementDirection.RIGHT if dc > 0 else MovementDirection.LEFT
                     lines.append(f"  Movement: {'+'.join(direction)} (dr={dr:.1f}, dc={dc:.1f})")
 
-    return "\n".join(lines)
+    raw_text = "\n".join(lines)
+
+    if structured:
+        return FrameAnalysis(
+            grid_size=(64, 64),
+            background=(int(bg_color), bg_name),
+            regions=regions,
+            movement=movement,
+            pixels_changed=pixels_changed,
+            change_region=change_region,
+            raw_text=raw_text,
+        )
+
+    return raw_text
 
 
 def compute_grid_diff(prev: np.ndarray, curr: np.ndarray) -> str:

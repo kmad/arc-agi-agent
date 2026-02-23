@@ -1,9 +1,12 @@
 """Reflection agents that observe game state and build knowledge bases."""
 
 import dspy
-import json
 from typing import Optional
 from game_state import GameHistory, frame_to_text, frame_to_image_bytes, analyze_frame
+from models import (
+    KnowledgeEntry, KnowledgeCategory, REPLTip, REPLCategory,
+    VisualAnalysis, MechanicsAnalysis, REPLAnalysis,
+)
 
 
 # ============================================================
@@ -107,7 +110,7 @@ class GameMechanicsSignature(dspy.Signature):
     You have access to the full game state history and metadata.
     Your job is to identify and document game mechanics, rules, and patterns.
 
-    Output a JSON list of knowledge entries, each with:
+    Output a list of knowledge entries, each with:
     - category: one of "player_mechanics", "game_rules", "level_structure", "win_condition", "obstacle", "item"
     - text: clear description of the mechanic/rule
     - confidence: 0-100 how confident you are
@@ -121,7 +124,7 @@ class GameMechanicsSignature(dspy.Signature):
     existing_game_kb: str = dspy.InputField(desc="Existing game knowledge base")
     visual_observations: str = dspy.InputField(desc="Recent visual observer analyses")
 
-    new_knowledge_entries: str = dspy.OutputField(desc="JSON list of new/updated knowledge entries")
+    new_knowledge_entries: list[KnowledgeEntry] = dspy.OutputField(desc="List of new/updated knowledge entries")
     mechanics_summary: str = dspy.OutputField(desc="Summary of understood game mechanics so far")
 
 
@@ -178,23 +181,37 @@ class GameMechanicsObserver:
                     visual_observations=vis_text,
                 )
 
-        # Parse new knowledge entries
+        # DSPy parses Pydantic natively — result.new_knowledge_entries is list[KnowledgeEntry]
         new_entries = []
-        try:
-            parsed = json.loads(result.new_knowledge_entries)
-            if isinstance(parsed, list):
-                for entry in parsed:
-                    entry["step"] = history.current_step
+        if isinstance(result.new_knowledge_entries, list):
+            for entry in result.new_knowledge_entries:
+                if isinstance(entry, KnowledgeEntry):
+                    entry.step = history.current_step
+                    entry.source = entry.source or "mechanics_observer"
+                    entry.compute_fingerprint()
                     new_entries.append(entry)
-        except (json.JSONDecodeError, TypeError):
-            # If JSON parsing fails, create a single entry from the text
-            new_entries.append({
-                "category": "observation",
-                "text": str(result.new_knowledge_entries),
-                "confidence": 50,
-                "source": "mechanics_observer",
-                "step": history.current_step,
-            })
+                elif isinstance(entry, dict):
+                    # Fallback for when DSPy returns raw dicts
+                    ke = KnowledgeEntry(
+                        category=KnowledgeCategory(entry.get("category", "observation")),
+                        text=str(entry.get("text", "")),
+                        confidence=int(entry.get("confidence", 50)),
+                        source=str(entry.get("source", "mechanics_observer")),
+                        step=history.current_step,
+                    )
+                    ke.compute_fingerprint()
+                    new_entries.append(ke)
+        elif isinstance(result.new_knowledge_entries, str):
+            # Fallback: create a single entry from text
+            ke = KnowledgeEntry(
+                category=KnowledgeCategory.OBSERVATION,
+                text=str(result.new_knowledge_entries),
+                confidence=50,
+                source="mechanics_observer",
+                step=history.current_step,
+            )
+            ke.compute_fingerprint()
+            new_entries.append(ke)
 
         return {
             "new_entries": new_entries,
@@ -216,7 +233,7 @@ class REPLStrategySignature(dspy.Signature):
 
     Think of this as building a skill.md for how to effectively use the REPL for this game.
 
-    Output a JSON list of REPL tips/patterns, each with:
+    Output a list of REPL tips/patterns, each with:
     - category: one of "analysis_pattern", "efficiency_tip", "code_template", "anti_pattern", "game_specific_tool"
     - text: clear description of the pattern/tip
     - code_example: optional example code snippet
@@ -228,7 +245,7 @@ class REPLStrategySignature(dspy.Signature):
     existing_repl_kb: str = dspy.InputField(desc="Existing REPL knowledge base")
     game_mechanics: str = dspy.InputField(desc="Known game mechanics")
 
-    new_repl_entries: str = dspy.OutputField(desc="JSON list of new REPL tips/patterns")
+    new_repl_entries: list[REPLTip] = dspy.OutputField(desc="List of new REPL tips/patterns")
     repl_strategy_summary: str = dspy.OutputField(desc="Summary of recommended REPL usage strategy")
 
 
@@ -270,17 +287,25 @@ class REPLStrategyObserver:
                     game_mechanics=history.get_game_kb_text(),
                 )
 
-        # Parse new entries
+        # DSPy parses Pydantic natively — result.new_repl_entries is list[REPLTip]
         new_entries = []
-        try:
-            parsed = json.loads(result.new_repl_entries)
-            if isinstance(parsed, list):
-                new_entries = parsed
-        except (json.JSONDecodeError, TypeError):
-            new_entries.append({
-                "category": "tip",
-                "text": str(result.new_repl_entries),
-            })
+        if isinstance(result.new_repl_entries, list):
+            for entry in result.new_repl_entries:
+                if isinstance(entry, REPLTip):
+                    new_entries.append(entry)
+                elif isinstance(entry, dict):
+                    try:
+                        new_entries.append(REPLTip.model_validate(entry))
+                    except Exception:
+                        new_entries.append(REPLTip(
+                            category=REPLCategory.TIP,
+                            text=str(entry.get("text", str(entry))),
+                        ))
+        elif isinstance(result.new_repl_entries, str):
+            new_entries.append(REPLTip(
+                category=REPLCategory.TIP,
+                text=str(result.new_repl_entries),
+            ))
 
         return {
             "new_entries": new_entries,

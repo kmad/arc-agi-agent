@@ -6,15 +6,18 @@ Architecture:
   - Game Mechanics Observer (RLM): Builds game mechanics knowledge base
   - REPL Strategy Observer (RLM): Builds REPL usage knowledge base
   - Instruction Optimizer (CoT): Rewrites solver instructions after each reflection cycle
+
+Supports local/offline mode (--local) for ~2000 FPS evaluation without API key,
+and multi-agent sync via --agent-id and --sync-dir.
 """
 
 import sys
 import time
 import json
+import os
 import numpy as np
 import dspy
 from arcengine.enums import GameAction, GameState
-from arc_agi import Arcade
 
 from config import (
     GEMINI_MODEL, GEMINI_MODEL_MINI,
@@ -26,6 +29,7 @@ from game_state import GameHistory, StepRecord, compute_grid_diff, frame_to_text
 from observers import VisualObserver, GameMechanicsObserver, REPLStrategyObserver
 from solver import Solver
 from optimizer import InstructionOptimizer
+from models import KnowledgeEntry, REPLTip, AgentReport, AgentStatus, AgentDirective
 
 
 # How often to run reflection agents (every N batches)
@@ -33,8 +37,18 @@ REFLECT_EVERY = 3
 
 
 def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
-              batch_size: int = RLM_BATCH_SIZE, reflect_every: int = REFLECT_EVERY):
-    """Run the full multi-agent system on a game."""
+              batch_size: int = RLM_BATCH_SIZE, reflect_every: int = REFLECT_EVERY,
+              local_mode: bool = False, agent_id: str = "agent_0",
+              sync_dir: str | None = None):
+    """Run the full multi-agent system on a game.
+
+    Args:
+        local_mode: Use OperationMode.OFFLINE for local evaluation (~2000 FPS).
+        agent_id: Identifier for this agent instance (for multi-agent orchestration).
+        sync_dir: Directory for inter-agent knowledge sync. If set, the agent will:
+            - Check for {sync_dir}/{agent_id}_injected.json each reflection cycle
+            - Export {sync_dir}/{agent_id}_report.json after each reflection cycle
+    """
 
     # === Configure LMs ===
     print(f"Configuring LMs: {GEMINI_MODEL}")
@@ -43,8 +57,13 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
     dspy.configure(lm=main_lm)
 
     # === Initialize game ===
-    print(f"Initializing game: {game_id}")
-    arcade = Arcade()
+    print(f"Initializing game: {game_id} (local={local_mode}, agent={agent_id})")
+    if local_mode:
+        from arc_agi import Arcade, OperationMode
+        arcade = Arcade(operation_mode=OperationMode.OFFLINE)
+    else:
+        from arc_agi import Arcade
+        arcade = Arcade()
     env = arcade.make(game_id)
 
     obs = env.reset()
@@ -66,6 +85,10 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
               f"{len(history.repl_knowledge_base)} REPL tips")
         if history.solver_instructions:
             print(f"  Loaded solver instructions ({len(history.solver_instructions)} chars)")
+
+    # Check for injected knowledge from orchestrator
+    if sync_dir:
+        _load_injected_knowledge(history, agent_id, sync_dir)
 
     history.add_step(StepRecord(
         step_number=0,
@@ -203,6 +226,8 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
                 print(f"  --- Forced Reflection (level complete) ---")
                 _run_reflection(history, visual_observations, repl_traces,
                                mechanics_observer, repl_observer, optimizer, vis_obs)
+                if sync_dir:
+                    _export_report(history, agent_id, sync_dir)
                 print(f"  --- End Forced Reflection ---")
 
             elif transition == "full_reset":
@@ -222,12 +247,16 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
             if result.state == GameState.WIN:
                 print(f"\n*** GAME WON in {move_count} steps! ***")
                 history.save_knowledge()
+                if sync_dir:
+                    _export_report(history, agent_id, sync_dir, status=AgentStatus.COMPLETED)
                 _print_final_stats(history, arcade)
                 return history
 
             if result.state == GameState.GAME_OVER:
                 print(f"\n!!! GAME OVER at step {move_count} !!!")
                 history.save_knowledge()
+                if sync_dir:
+                    _export_report(history, agent_id, sync_dir, status=AgentStatus.FAILED)
                 _print_final_stats(history, arcade)
                 return history
 
@@ -236,10 +265,16 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
             print(f"\n--- Reflection Cycle (batch {batch_number}) ---")
             _run_reflection(history, visual_observations, repl_traces,
                            mechanics_observer, repl_observer, optimizer, vis_obs)
+            # Sync with orchestrator if sync_dir is set
+            if sync_dir:
+                _load_injected_knowledge(history, agent_id, sync_dir)
+                _export_report(history, agent_id, sync_dir)
             print(f"--- End Reflection ---")
 
     print(f"\nMax steps ({max_steps}) reached.")
     history.save_knowledge()
+    if sync_dir:
+        _export_report(history, agent_id, sync_dir, status=AgentStatus.COMPLETED)
     _print_final_stats(history, arcade)
     return history
 
@@ -255,7 +290,9 @@ def _run_reflection(history, visual_observations, repl_traces,
             history.game_knowledge_base.extend(new_entries)
             print(f"[Mechanics] +{len(new_entries)} entries")
             for e in new_entries[:3]:
-                print(f"  [{e.get('confidence','?')}%] {e.get('text','')[:80]}")
+                conf = e.confidence if hasattr(e, 'confidence') else '?'
+                text = e.text if hasattr(e, 'text') else str(e)
+                print(f"  [{conf}%] {text[:80]}")
     except Exception as e:
         print(f"[Mechanics] ERROR: {e}")
 
@@ -281,7 +318,46 @@ def _run_reflection(history, visual_observations, repl_traces,
     history.save_knowledge()
 
 
-def _print_final_stats(history: GameHistory, arcade: Arcade):
+def _load_injected_knowledge(history: GameHistory, agent_id: str, sync_dir: str):
+    """Load knowledge injected by the orchestrator (with optional directive)."""
+    inject_path = os.path.join(sync_dir, f"{agent_id}_injected.json")
+    if not os.path.exists(inject_path):
+        return
+    try:
+        with open(inject_path) as f:
+            data = json.load(f)
+        knowledge = [KnowledgeEntry.model_validate(e) for e in data.get("knowledge", [])]
+        repl_tips = [REPLTip.model_validate(e) for e in data.get("repl_tips", [])]
+        history.inject_knowledge(knowledge, repl_tips)
+        # Apply agent-specific directive from StrategicReasoner
+        directive_data = data.get("directive")
+        if directive_data:
+            directive = AgentDirective.model_validate(directive_data)
+            history.apply_directive(directive)
+            print(f"  [Sync] Applied directive: focus={directive.focus_area}")
+            if directive.avoid:
+                print(f"  [Sync]   avoid: {directive.avoid}")
+            if directive.try_actions:
+                print(f"  [Sync]   try: {directive.try_actions}")
+        # Remove the file after consuming
+        os.remove(inject_path)
+        print(f"  [Sync] Injected {len(knowledge)} knowledge entries, {len(repl_tips)} REPL tips from orchestrator")
+    except Exception as e:
+        print(f"  [Sync] Failed to load injected knowledge: {e}")
+
+
+def _export_report(history: GameHistory, agent_id: str, sync_dir: str,
+                   status: AgentStatus = AgentStatus.RUNNING):
+    """Export an AgentReport for the orchestrator to collect."""
+    os.makedirs(sync_dir, exist_ok=True)
+    report = history.export_report(agent_id=agent_id)
+    report.status = status
+    report_path = os.path.join(sync_dir, f"{agent_id}_report.json")
+    with open(report_path, "w") as f:
+        json.dump(report.model_dump(), f, indent=2)
+
+
+def _print_final_stats(history: GameHistory, arcade):
     """Print final game statistics."""
     print(f"\n{'='*70}")
     print(f"FINAL: {history.current_step} steps | {history.levels_completed}/{history.total_levels} levels")
@@ -307,7 +383,8 @@ def _print_final_stats(history: GameHistory, arcade: Arcade):
 
 
 def run_gepa_then_play(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
-                       gepa_calls: int = 10, episode_steps: int = 80):
+                       gepa_calls: int = 10, episode_steps: int = 80,
+                       local_mode: bool = False):
     """GEPA pre-optimization then full multi-agent play."""
     from gepa_optimizer import run_gepa_optimization
 
@@ -326,7 +403,7 @@ def run_gepa_then_play(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
     print("\n" + "=" * 70)
     print("PHASE 2: Full Multi-Agent System")
     print("=" * 70)
-    history = run_agent(game_id=game_id, max_steps=max_steps)
+    history = run_agent(game_id=game_id, max_steps=max_steps, local_mode=local_mode)
     return history
 
 
@@ -339,14 +416,22 @@ if __name__ == "__main__":
     parser.add_argument("--reflect", type=int, default=REFLECT_EVERY, help="Reflect every N batches")
     parser.add_argument("--gepa", action="store_true", help="Run GEPA pre-optimization")
     parser.add_argument("--gepa-calls", type=int, default=10, help="GEPA metric calls")
+    parser.add_argument("--local", action="store_true", help="Use local/offline mode (~2000 FPS, no API key)")
+    parser.add_argument("--agent-id", default="agent_0", help="Agent ID for multi-agent orchestration")
+    parser.add_argument("--sync-dir", default=None, help="Directory for inter-agent knowledge sync")
     args = parser.parse_args()
 
     print(f"ARC AGI 3 Multi-Agent System")
     print(f"  Game: {args.game} | Steps: {args.steps} | Reflect: every {args.reflect} batches")
-    print(f"  Model: {GEMINI_MODEL} | GEPA: {args.gepa}")
+    print(f"  Model: {GEMINI_MODEL} | GEPA: {args.gepa} | Local: {args.local}")
+    if args.sync_dir:
+        print(f"  Agent ID: {args.agent_id} | Sync Dir: {args.sync_dir}")
     print()
 
     if args.gepa:
-        run_gepa_then_play(game_id=args.game, max_steps=args.steps, gepa_calls=args.gepa_calls)
+        run_gepa_then_play(game_id=args.game, max_steps=args.steps,
+                           gepa_calls=args.gepa_calls, local_mode=args.local)
     else:
-        run_agent(game_id=args.game, max_steps=args.steps, batch_size=args.batch, reflect_every=args.reflect)
+        run_agent(game_id=args.game, max_steps=args.steps, batch_size=args.batch,
+                  reflect_every=args.reflect, local_mode=args.local,
+                  agent_id=args.agent_id, sync_dir=args.sync_dir)

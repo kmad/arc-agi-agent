@@ -5,7 +5,6 @@ agents analyze the game state. This optimizer then synthesizes their findings in
 updated instructions for the solver agent."""
 
 import dspy
-import json
 
 
 class InstructionOptimizerSignature(dspy.Signature):

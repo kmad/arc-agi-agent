@@ -14,7 +14,7 @@ import dspy
 from dataclasses import dataclass
 from typing import Optional
 from arcengine.enums import GameAction, GameState
-from arc_agi import Arcade
+from arc_agi import Arcade, OperationMode
 
 from config import GEMINI_MODEL, GEMINI_MODEL_MINI
 from actions import build_action_map, format_action_space, get_valid_action_names
@@ -65,7 +65,7 @@ class GameEpisode:
     seed: int = 0
 
 
-def create_evaluator(game_id: str = "ls20", max_episode_steps: int = 100):
+def create_evaluator(game_id: str = "ls20", max_episode_steps: int = 100, local: bool = False):
     """Create a GEPA evaluator that scores strategy artifacts by playing the game.
 
     The evaluator:
@@ -73,6 +73,9 @@ def create_evaluator(game_id: str = "ls20", max_episode_steps: int = 100):
     2. Uses it to configure a simple solver
     3. Plays the game for max_episode_steps
     4. Returns score (levels completed / total) + ASI diagnostics
+
+    Args:
+        local: If True, use OperationMode.OFFLINE (~2000 FPS, no API key needed).
     """
 
     def evaluate(candidate: str, data_instance=None) -> tuple[float, dict]:
@@ -80,7 +83,10 @@ def create_evaluator(game_id: str = "ls20", max_episode_steps: int = 100):
         lm = dspy.LM(GEMINI_MODEL, max_tokens=4096)
 
         # Set up game
-        arcade = Arcade()
+        if local:
+            arcade = Arcade(operation_mode=OperationMode.OFFLINE)
+        else:
+            arcade = Arcade()
         env = arcade.make(game_id)
         obs = env.reset()
         initial_frame = np.array(obs.frame)[0]

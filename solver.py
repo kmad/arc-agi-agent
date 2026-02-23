@@ -19,6 +19,7 @@ from enum import Enum
 from typing import Optional
 from game_state import GameHistory, frame_to_text, compute_grid_diff, analyze_frame
 from actions import format_action_space, get_valid_action_names
+from models import GameHypothesis, ActionEffect, FrameAnalysis, VisualAnalysis
 
 
 class SolverPhase(Enum):
@@ -53,7 +54,7 @@ class ExploreSignature(dspy.Signature):
     available_actions: str = dspy.InputField(desc="All available actions in this game")
 
     exploration_plan: str = dspy.OutputField(desc="Direction map so far: which action = which direction? What's still unknown?")
-    actions: str = dspy.OutputField(desc='JSON list of 4-8 actions. e.g. ["ACTION1","ACTION2","ACTION3","ACTION4"]')
+    actions: list[str] = dspy.OutputField(desc='List of 4-8 actions. e.g. ["ACTION1","ACTION2","ACTION3","ACTION4"]')
 
 
 class HypothesizeSignature(dspy.Signature):
@@ -76,8 +77,8 @@ class HypothesizeSignature(dspy.Signature):
     exploration_log: str = dspy.InputField(desc="Full log of actions taken and their pixel-change effects")
     available_actions: str = dspy.InputField(desc="Available actions")
 
-    hypotheses: str = dspy.OutputField(desc='JSON list of hypotheses: [{"mechanic": "...", "description": "...", "confidence": 0-100, "test": "how to verify"}]')
-    actions: str = dspy.OutputField(desc='JSON list of 4-8 actions to begin testing the top hypothesis')
+    hypotheses: list[GameHypothesis] = dspy.OutputField(desc="List of hypotheses about game mechanics")
+    actions: list[str] = dspy.OutputField(desc='List of 4-8 actions to begin testing the top hypothesis')
 
 
 class IterateSignature(dspy.Signature):
@@ -99,9 +100,9 @@ class IterateSignature(dspy.Signature):
     recent_test_results: str = dspy.InputField(desc="Recent action results vs predictions")
     available_actions: str = dspy.InputField(desc="Available actions")
 
-    updated_hypotheses: str = dspy.OutputField(desc='JSON: updated hypotheses with new confidence levels after testing')
+    updated_hypotheses: list[GameHypothesis] = dspy.OutputField(desc="Updated hypotheses with new confidence levels after testing")
     phase_recommendation: str = dspy.OutputField(desc='Either "keep_iterating" or "ready_to_execute" with reason')
-    actions: str = dspy.OutputField(desc='JSON list of 4-8 targeted test actions')
+    actions: list[str] = dspy.OutputField(desc='List of 4-8 targeted test actions')
 
 
 class ExecuteSignature(dspy.Signature):
@@ -131,7 +132,7 @@ class ExecuteSignature(dspy.Signature):
     available_actions: str = dspy.InputField(desc="Available actions")
 
     plan: str = dspy.OutputField(desc="Step-by-step plan: which actions are working, which are blocked, what to do next")
-    actions: str = dspy.OutputField(desc='JSON list of 3-8 precise goal-directed actions. NEVER use actions that are BLOCKED.')
+    actions: list[str] = dspy.OutputField(desc='List of 3-8 precise goal-directed actions. NEVER use actions that are BLOCKED.')
 
 
 # ── Phase-aware Solver ─────────────────────────────────────────────
@@ -162,12 +163,12 @@ class Solver:
         self.phase_step_count = 0  # Steps within current phase
         self.iterate_rounds = 0
 
-        # Knowledge accumulated across phases
+        # Knowledge accumulated across phases (typed)
         self.action_effects: dict[str, list[str]] = {a: [] for a in self.available_actions}
         self.action_effectiveness: dict[str, dict] = {}  # action -> {productive, tiny, total}
         self.action_directions: dict[str, list[str]] = {}  # action -> observed directions
-        self.hypotheses: list[dict] = []
-        self.confirmed_mechanics: list[dict] = []
+        self.hypotheses: list[GameHypothesis] = []
+        self.confirmed_mechanics: list[GameHypothesis] = []
 
         # RLM modules for discovery phases (sub-LLM explores solution space)
         # Keep iterations low for speed — each iteration = full LLM call
@@ -255,7 +256,7 @@ class Solver:
             available_actions=actions_desc,
         )
 
-        actions = self._parse_batch_actions(result.actions)
+        actions = self._validate_actions(result.actions)
 
         # Ensure exploration diversity: if parsed actions lack variety, force it
         if len(set(actions)) < min(3, len(self.available_actions)):
@@ -282,78 +283,30 @@ class Solver:
             available_actions=actions_desc,
         )
 
-        # Parse hypotheses — try JSON first, then extract from text
-        parsed_ok = False
-        try:
-            # Try to extract JSON from the response (may be wrapped in markdown)
-            hyp_text = result.hypotheses
-            # Strip markdown code fences if present
-            if "```" in hyp_text:
-                import re
-                json_match = re.search(r'```(?:json)?\s*([\s\S]*?)```', hyp_text)
-                if json_match:
-                    hyp_text = json_match.group(1).strip()
-
-            parsed = json.loads(hyp_text)
-            if isinstance(parsed, list):
-                self.hypotheses = parsed
-                parsed_ok = True
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        if not parsed_ok:
-            # Fallback: create hypotheses by analyzing action effects programmatically
-            self.hypotheses = []
-            import re
-
-            # Group actions by their effect regions
-            row_groups = {}  # row_range -> list of actions
-            for action, effects in self.action_effects.items():
-                if not effects:
-                    continue
-                # Extract row ranges from effects
-                for e in effects:
-                    m = re.search(r"rows (\d+)-(\d+)", e)
-                    if m:
-                        row_range = f"rows {m.group(1)}-{m.group(2)}"
-                        row_groups.setdefault(row_range, []).append(action)
-                        break
-
-                self.hypotheses.append({
-                    "mechanic": f"{action}_movement",
-                    "description": f"{action} shifts objects in {effects[-1][:120]}",
-                    "confidence": 70,
-                    "test": f"Repeat {action} and check column progression"
-                })
-
-            # Add grouping hypothesis if actions affect different row ranges
-            if len(row_groups) > 1:
-                groups_desc = "; ".join(f"{k}: {', '.join(set(v))}" for k, v in row_groups.items())
-                self.hypotheses.insert(0, {
-                    "mechanic": "action_row_groups",
-                    "description": f"Actions affect DIFFERENT row ranges: {groups_desc}",
-                    "confidence": 85,
-                    "test": "Compare row ranges when different actions are at same column position"
-                })
-
-            print(f"  [Hypothesize] JSON parse failed, built {len(self.hypotheses)} hypotheses from action effects")
+        # DSPy parses Pydantic natively — result.hypotheses is list[GameHypothesis]
+        if result.hypotheses and isinstance(result.hypotheses, list):
+            self.hypotheses = self._coerce_hypotheses(result.hypotheses)
+        else:
+            # Fallback: build hypotheses from action effects programmatically
+            self.hypotheses = self._build_fallback_hypotheses()
+            print(f"  [Hypothesize] Built {len(self.hypotheses)} fallback hypotheses from action effects")
 
         if self.hypotheses:
             print(f"  [Hypothesize] {len(self.hypotheses)} hypotheses formed:")
             for h in self.hypotheses[:3]:
-                print(f"    [{h.get('confidence', '?')}%] {h.get('mechanic', '?')}: {h.get('description', '?')[:70]}")
+                print(f"    [{h.confidence}%] {h.mechanic}: {h.description[:70]}")
 
         # Transition to ITERATE after forming hypotheses
         self._transition_to(SolverPhase.ITERATE)
 
-        return self._parse_batch_actions(result.actions)
+        return self._validate_actions(result.actions)
 
     def _iterate(self, history: GameHistory) -> list[str]:
         """ITERATE: Test hypotheses with targeted experiments."""
         self.iterate_rounds += 1
         actions_desc = ", ".join(self.available_actions)
 
-        hypotheses_text = json.dumps(self.hypotheses, indent=2) if self.hypotheses else "No hypotheses yet."
+        hypotheses_text = self._format_hypotheses_text()
         recent_results = history.get_recent_action_diffs(15)
 
         prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
@@ -367,19 +320,16 @@ class Solver:
             available_actions=actions_desc,
         )
 
-        # Update hypotheses from iteration results
-        try:
-            updated = json.loads(result.updated_hypotheses)
-            if isinstance(updated, list):
-                self.hypotheses = updated
-                # Promote high-confidence hypotheses to confirmed mechanics
-                newly_confirmed = [h for h in self.hypotheses if h.get("confidence", 0) >= self.HIGH_CONFIDENCE]
-                for h in newly_confirmed:
-                    if h not in self.confirmed_mechanics:
+        # DSPy parses Pydantic natively — result.updated_hypotheses is list[GameHypothesis]
+        if result.updated_hypotheses and isinstance(result.updated_hypotheses, list):
+            self.hypotheses = self._coerce_hypotheses(result.updated_hypotheses)
+            # Promote high-confidence hypotheses to confirmed mechanics
+            for h in self.hypotheses:
+                if h.confidence >= self.HIGH_CONFIDENCE:
+                    if not any(cm.mechanic == h.mechanic for cm in self.confirmed_mechanics):
+                        h.confirmed = True
                         self.confirmed_mechanics.append(h)
-                        print(f"  [Iterate] CONFIRMED: {h.get('mechanic', '?')}: {h.get('description', '?')[:60]}")
-        except (json.JSONDecodeError, TypeError):
-            pass
+                        print(f"  [Iterate] CONFIRMED: {h.mechanic}: {h.description[:60]}")
 
         # Check if ready to execute
         phase_rec = result.phase_recommendation if hasattr(result, 'phase_recommendation') else ""
@@ -387,7 +337,7 @@ class Solver:
             print(f"  [Iterate] {len(self.confirmed_mechanics)} mechanics confirmed, transitioning to EXECUTE")
             self._transition_to(SolverPhase.EXECUTE)
 
-        return self._parse_batch_actions(result.actions)
+        return self._validate_actions(result.actions)
 
     def _execute(self, history: GameHistory, visual_obs: dict) -> list[str]:
         """EXECUTE: Fast goal-directed play using confirmed mechanics."""
@@ -418,7 +368,7 @@ class Solver:
             available_actions=actions_desc,
         )
 
-        actions = self._parse_batch_actions(result.actions)
+        actions = self._validate_actions(result.actions)
 
         # Post-filter: remove blocked actions from the batch
         if effective_actions and len(effective_actions) < len(self.available_actions):
@@ -595,11 +545,11 @@ class Solver:
         if self.confirmed_mechanics:
             lines.append("Confirmed mechanics:")
             for m in self.confirmed_mechanics:
-                lines.append(f"  [{m.get('confidence', '?')}%] {m.get('mechanic', '?')}: {m.get('description', '?')}")
+                lines.append(f"  [{m.confidence}%] {m.mechanic}: {m.description}")
         elif self.hypotheses:
             lines.append("Unconfirmed hypotheses:")
             for h in self.hypotheses:
-                lines.append(f"  [{h.get('confidence', '?')}%] {h.get('mechanic', '?')}: {h.get('description', '?')}")
+                lines.append(f"  [{h.confidence}%] {h.mechanic}: {h.description}")
         else:
             lines.append("No mechanics confirmed yet. Explore and observe.")
 
@@ -612,6 +562,15 @@ class Solver:
                 lines.append(f"  {action}: {stats['productive']} productive, {stats['tiny']} tiny/blocked out of {stats['total']} total -> {status}")
 
         return "\n".join(lines)
+
+    def _format_hypotheses_text(self) -> str:
+        """Format hypotheses as text for the iterate signature input."""
+        if not self.hypotheses:
+            return "No hypotheses yet."
+        items = []
+        for h in self.hypotheses:
+            items.append(h.model_dump())
+        return json.dumps(items, indent=2)
 
     def _get_effective_actions(self) -> list[str]:
         """Return actions that are currently producing useful changes.
@@ -633,6 +592,62 @@ class Solver:
         return effective if effective else list(self.available_actions)
 
     # ── Utility methods ──
+
+    def _coerce_hypotheses(self, raw: list) -> list[GameHypothesis]:
+        """Coerce a list of mixed dicts/GameHypothesis into list[GameHypothesis]."""
+        result = []
+        for item in raw:
+            if isinstance(item, GameHypothesis):
+                result.append(item)
+            elif isinstance(item, dict):
+                try:
+                    result.append(GameHypothesis.model_validate(item))
+                except Exception:
+                    # Best-effort: extract what we can
+                    result.append(GameHypothesis(
+                        mechanic=str(item.get("mechanic", "unknown")),
+                        description=str(item.get("description", "")),
+                        confidence=int(item.get("confidence", 50)),
+                        test=str(item.get("test", "")),
+                    ))
+        return result
+
+    def _build_fallback_hypotheses(self) -> list[GameHypothesis]:
+        """Build hypotheses by analyzing action effects programmatically."""
+        import re
+        hypotheses = []
+
+        # Group actions by their effect regions
+        row_groups = {}  # row_range -> list of actions
+        for action, effects in self.action_effects.items():
+            if not effects:
+                continue
+            # Extract row ranges from effects
+            for e in effects:
+                m = re.search(r"rows (\d+)-(\d+)", e)
+                if m:
+                    row_range = f"rows {m.group(1)}-{m.group(2)}"
+                    row_groups.setdefault(row_range, []).append(action)
+                    break
+
+            hypotheses.append(GameHypothesis(
+                mechanic=f"{action}_movement",
+                description=f"{action} shifts objects in {effects[-1][:120]}",
+                confidence=70,
+                test=f"Repeat {action} and check column progression",
+            ))
+
+        # Add grouping hypothesis if actions affect different row ranges
+        if len(row_groups) > 1:
+            groups_desc = "; ".join(f"{k}: {', '.join(set(v))}" for k, v in row_groups.items())
+            hypotheses.insert(0, GameHypothesis(
+                mechanic="action_row_groups",
+                description=f"Actions affect DIFFERENT row ranges: {groups_desc}",
+                confidence=85,
+                test="Compare row ranges when different actions are at same column position",
+            ))
+
+        return hypotheses
 
     def _diverse_exploration_batch(self) -> list[str]:
         """Generate a batch that tests each action at least twice."""
@@ -666,20 +681,36 @@ class Solver:
                 result[i + 1] = other
         return result
 
-    def _parse_batch_actions(self, actions_str: str) -> list[str]:
-        """Parse a batch of actions from solver output."""
+    def _validate_actions(self, actions_output) -> list[str]:
+        """Validate and filter actions from DSPy typed output.
+
+        With typed signatures, actions_output should already be list[str].
+        Falls back to parsing if DSPy returns a string instead.
+        """
         valid_actions = set(self.available_actions)
+
+        # If DSPy parsed it correctly as a list
+        if isinstance(actions_output, list):
+            result = []
+            for a in actions_output:
+                clean = str(a).strip().upper()
+                if clean in valid_actions:
+                    result.append(clean)
+            if result:
+                return result
+
+        # Fallback: parse from string (handles JSON strings, comma-separated, etc.)
+        actions_str = str(actions_output)
         try:
-            actions = json.loads(actions_str)
-            if isinstance(actions, list):
-                parsed = [a.strip().upper() for a in actions if isinstance(a, str)]
-                result = [a for a in parsed if a in valid_actions]
+            parsed = json.loads(actions_str)
+            if isinstance(parsed, list):
+                result = [str(a).strip().upper() for a in parsed if str(a).strip().upper() in valid_actions]
                 if result:
                     return result
         except (json.JSONDecodeError, TypeError):
             pass
 
-        # Fallback: extract action names from text
+        # Last resort: extract action names from text
         actions = []
         for token in actions_str.upper().replace(",", " ").replace('"', " ").replace("[", " ").replace("]", " ").split():
             clean = token.strip()
