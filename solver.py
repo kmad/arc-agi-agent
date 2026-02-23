@@ -34,26 +34,30 @@ class SolverPhase(Enum):
 class ExploreSignature(dspy.Signature):
     """You are systematically exploring an unknown puzzle game on a 64x64 grid.
 
-    Your ONLY goal right now is to discover what each action does.
-    Look at the 'Movement' line in the frame diff to determine direction.
-    For each available action, determine:
-    - DIRECTION: Does it move something UP, DOWN, LEFT, or RIGHT?
-    - MAGNITUDE: How many pixels does it shift?
-    - RANGE: Which rows/columns are affected?
-    - BLOCKED: Does it produce tiny/no change? (means it hit a wall)
+    You have ALREADY run a programmatic pre-exploration that tested each action
+    10 times in isolation. The results are in 'exploration_data' as a pandas-style
+    summary showing per-action direction, pixel changes, and blocking info.
 
-    IMPORTANT: The 'Movement' field in the analysis tells you the DIRECTION
-    of the last action's effect. Compare across actions to build a direction map.
+    Use this data to:
+    1. Confirm the action->direction mapping from the pre-exploration data
+    2. Test COMBINATIONS of actions (e.g., ACTION1 then ACTION3)
+    3. Look for interactions between objects
+    4. Find edges/boundaries by running actions until blocked
+    5. Identify what changed vs the initial state
 
-    Design an exploration sequence that tests EVERY available action.
-    Output a batch of actions as a JSON list."""
+    You can reference the exploration_data to do pandas-style analysis:
+    e.g., "ACTION1 moves RIGHT ~5px per step, ACTION2 moves DOWN"
+
+    Output a batch of actions designed to TEST HYPOTHESES, not just repeat
+    what the pre-exploration already discovered."""
 
     frame_analysis: str = dspy.InputField(desc="Programmatic analysis with Movement direction for last action")
     game_state: str = dspy.InputField(desc="Game state: step count, levels, recent actions")
-    action_effects_so_far: str = dspy.InputField(desc="What we know about each action's effect so far, including movement direction")
+    exploration_data: str = dspy.InputField(desc="Pre-exploration results: per-action direction mapping, pixel changes, blocking rates")
+    action_effects_so_far: str = dspy.InputField(desc="What we know about each action's effect so far from the CURRENT game session")
     available_actions: str = dspy.InputField(desc="All available actions in this game")
 
-    exploration_plan: str = dspy.OutputField(desc="Direction map so far: which action = which direction? What's still unknown?")
+    exploration_plan: str = dspy.OutputField(desc="What did pre-exploration reveal? What combinations/interactions should we test next?")
     actions: list[str] = dspy.OutputField(desc='List of 4-8 actions. e.g. ["ACTION1","ACTION2","ACTION3","ACTION4"]')
 
 
@@ -233,7 +237,7 @@ class Solver:
     # ── Phase handlers ──
 
     def _explore(self, history: GameHistory) -> list[str]:
-        """EXPLORE: Systematically try every action, maximize information gain."""
+        """EXPLORE: Use pre-exploration data to design targeted experiments."""
         # First batch: deterministic — try each action once to get baseline effects
         untested = [a for a in self.available_actions if not self.action_effects.get(a)]
         if untested:
@@ -243,15 +247,19 @@ class Solver:
             batch.extend(untested)
             return batch[:12]
 
-        # Subsequent batches: use LLM to design experiments based on observations
+        # Subsequent batches: use LLM with pre-exploration data
         effects_text = self._format_action_effects()
         actions_desc = ", ".join(self.available_actions)
         prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
         analysis = analyze_frame(history.last_frame, prev_frame)
 
+        # Include pre-exploration data if available
+        exploration_data = getattr(history, 'exploration_summary', '') or "No pre-exploration data."
+
         result = self.explorer(
             frame_analysis=analysis,
             game_state=history.get_state_summary(),
+            exploration_data=exploration_data,
             action_effects_so_far=effects_text,
             available_actions=actions_desc,
         )

@@ -42,6 +42,10 @@ class GameHistory:
     # Active directive from orchestrator's StrategicReasoner
     active_directive: Optional[AgentDirective] = None
 
+    # Exploration data (from programmatic pre-exploration)
+    exploration_csv: str = ""
+    exploration_summary: str = ""
+
     # Per-level tracking
     level_knowledge: dict[int, list[dict]] = field(default_factory=dict)
     level_attempts: dict[int, int] = field(default_factory=lambda: {})

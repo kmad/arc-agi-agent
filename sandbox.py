@@ -27,7 +27,7 @@ REPO_DIR = "/home/daytona/arc"
 SOURCE_FILES = [
     "models.py", "agent.py", "solver.py", "game_state.py", "config.py",
     "observers.py", "optimizer.py", "gepa_optimizer.py",
-    "actions.py", "orchestrator.py", "strategic_reasoner.py",
+    "actions.py", "orchestrator.py", "strategic_reasoner.py", "explorer.py",
 ]
 
 

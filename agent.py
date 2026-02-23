@@ -29,6 +29,7 @@ from game_state import GameHistory, StepRecord, compute_grid_diff, frame_to_text
 from observers import VisualObserver, GameMechanicsObserver, REPLStrategyObserver
 from solver import Solver
 from optimizer import InstructionOptimizer
+from explorer import run_exploration, summarize_exploration, exploration_to_knowledge
 from models import KnowledgeEntry, REPLTip, AgentReport, AgentStatus, AgentDirective
 
 
@@ -104,6 +105,59 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
     print(f"  Action map: {action_desc}")
     print(f"  Grid values: {np.unique(initial_frame)}")
 
+    # === Programmatic Pre-Exploration ===
+    # Systematically test each action in isolation before the LLM solver runs.
+    # Produces a DataFrame of action effects that seeds the knowledge base.
+    print(f"\n{'='*70}")
+    print(f"PRE-EXPLORATION: Systematic action mapping (no LLM)")
+    print(f"{'='*70}")
+    try:
+        exploration_df = run_exploration(env, reps_per_action=10)
+        exploration_summary = summarize_exploration(exploration_df)
+        print(exploration_summary)
+
+        # Convert to knowledge entries and inject
+        exploration_entries = exploration_to_knowledge(exploration_df)
+        for entry_dict in exploration_entries:
+            entry = KnowledgeEntry.model_validate(entry_dict)
+            entry.compute_fingerprint()
+            history.game_knowledge_base.append(entry)
+        print(f"  Injected {len(exploration_entries)} knowledge entries from exploration")
+
+        # Store the DataFrame as CSV string for RLM access
+        history.exploration_csv = exploration_df.to_csv(index=False)
+        history.exploration_summary = exploration_summary
+
+        # Reset game back to clean state for the main loop
+        obs = env.reset()
+        initial_frame = np.array(obs.frame)[0]
+        history.steps.clear()
+        history.add_step(StepRecord(
+            step_number=0,
+            action="RESET",
+            frame=initial_frame,
+            state=str(obs.state),
+            levels_completed=obs.levels_completed,
+            grid_diff="Initial frame (post-exploration).",
+        ))
+    except Exception as e:
+        print(f"  [Exploration] ERROR: {e}")
+        import traceback; traceback.print_exc()
+        history.exploration_csv = ""
+        history.exploration_summary = ""
+        # Re-reset in case exploration left game in bad state
+        obs = env.reset()
+        initial_frame = np.array(obs.frame)[0]
+        history.steps.clear()
+        history.add_step(StepRecord(
+            step_number=0,
+            action="RESET",
+            frame=initial_frame,
+            state=str(obs.state),
+            levels_completed=obs.levels_completed,
+            grid_diff="Initial frame.",
+        ))
+
     # === Initialize agents ===
     solver = Solver(lm=main_lm, sub_lm=mini_lm, available_actions=action_names)
     visual_observer = VisualObserver(lm=main_lm, use_screenshots=False)
@@ -168,7 +222,7 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
             try:
                 if action_params and "x" in action_params and "y" in action_params:
                     # Click action with coordinates
-                    result = env.step(game_action, x=action_params["x"], y=action_params["y"])
+                    result = env.step(game_action, data=action_params)
                 else:
                     result = env.step(game_action)
             except Exception as e:
