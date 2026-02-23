@@ -17,7 +17,7 @@ import json
 import numpy as np
 from enum import Enum
 from typing import Optional
-from game_state import GameHistory, frame_to_text, compute_grid_diff, analyze_frame
+from game_state import GameHistory, frame_to_text, compute_grid_diff, analyze_frame, frame_to_dspy_image
 from actions import format_action_space, get_valid_action_names
 from models import GameHypothesis, ActionEffect, FrameAnalysis, VisualAnalysis
 
@@ -51,6 +51,8 @@ class ExploreSignature(dspy.Signature):
     Output a batch of actions designed to TEST HYPOTHESES, not just repeat
     what the pre-exploration already discovered."""
 
+    board_before: dspy.Image = dspy.InputField(desc="Screenshot of the game board BEFORE the last action")
+    board_after: dspy.Image = dspy.InputField(desc="Screenshot of the game board AFTER the last action (current state)")
     frame_analysis: str = dspy.InputField(desc="Programmatic analysis with Movement direction for last action")
     game_state: str = dspy.InputField(desc="Game state: step count, levels, recent actions")
     exploration_data: str = dspy.InputField(desc="Pre-exploration results: per-action direction mapping, pixel changes, blocking rates")
@@ -76,6 +78,8 @@ class HypothesizeSignature(dspy.Signature):
 
     Also output the NEXT set of actions to begin testing your strongest hypothesis."""
 
+    board_before: dspy.Image = dspy.InputField(desc="Screenshot of the game board BEFORE the last action")
+    board_after: dspy.Image = dspy.InputField(desc="Screenshot of the game board AFTER the last action (current state)")
     frame_analysis: str = dspy.InputField(desc="Programmatic analysis: objects, positions, sizes, diff from previous frame")
     game_state: str = dspy.InputField(desc="Game state summary")
     exploration_log: str = dspy.InputField(desc="Full log of actions taken and their pixel-change effects")
@@ -98,6 +102,8 @@ class IterateSignature(dspy.Signature):
     Once a hypothesis reaches 90%+ confidence, it becomes confirmed knowledge.
     Once enough mechanics are confirmed, recommend switching to EXECUTE phase."""
 
+    board_before: dspy.Image = dspy.InputField(desc="Screenshot of the game board BEFORE the last action")
+    board_after: dspy.Image = dspy.InputField(desc="Screenshot of the game board AFTER the last action (current state)")
     frame_analysis: str = dspy.InputField(desc="Programmatic analysis: objects, positions, diffs")
     game_state: str = dspy.InputField(desc="Game state summary")
     hypotheses: str = dspy.InputField(desc="Current hypotheses with confidence levels")
@@ -128,6 +134,8 @@ class ExecuteSignature(dspy.Signature):
     Be EFFICIENT. Every wasted action may cost a resource.
     If an action suddenly produces tiny changes, STOP using it immediately."""
 
+    board_before: dspy.Image = dspy.InputField(desc="Screenshot of the game board BEFORE the last action")
+    board_after: dspy.Image = dspy.InputField(desc="Screenshot of the game board AFTER the last action (current state)")
     frame_analysis: str = dspy.InputField(desc="Programmatic analysis: objects, positions, confirmed mechanics context")
     game_state: str = dspy.InputField(desc="Game state with level info and knowledge")
     confirmed_mechanics: str = dspy.InputField(desc="Confirmed game mechanics and rules, including which actions are BLOCKED")
@@ -234,6 +242,18 @@ class Solver:
 
         return actions
 
+    # ── Board image helpers ──
+
+    def _get_board_images(self, history: GameHistory) -> tuple:
+        """Get before/after dspy.Image objects for the current and previous frames."""
+        current = history.last_frame
+        prev = history.steps[-2].frame if len(history.steps) >= 2 else None
+
+        img_after = frame_to_dspy_image(current) if current is not None else frame_to_dspy_image(np.zeros((64, 64), dtype=np.uint8))
+        img_before = frame_to_dspy_image(prev) if prev is not None else img_after
+
+        return img_before, img_after
+
     # ── Phase handlers ──
 
     def _explore(self, history: GameHistory) -> list[str]:
@@ -252,11 +272,14 @@ class Solver:
         actions_desc = ", ".join(self.available_actions)
         prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
         analysis = analyze_frame(history.last_frame, prev_frame)
+        img_before, img_after = self._get_board_images(history)
 
         # Include pre-exploration data if available
         exploration_data = getattr(history, 'exploration_summary', '') or "No pre-exploration data."
 
         result = self.explorer(
+            board_before=img_before,
+            board_after=img_after,
             frame_analysis=analysis,
             game_state=history.get_state_summary(),
             exploration_data=exploration_data,
@@ -278,6 +301,7 @@ class Solver:
         actions_desc = ", ".join(self.available_actions)
         prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
         analysis = analyze_frame(history.last_frame, prev_frame)
+        img_before, img_after = self._get_board_images(history)
 
         # Include action effects summary and any existing solver instructions
         enriched_log = self._format_action_effects() + "\n\n" + exploration_log
@@ -285,6 +309,8 @@ class Solver:
             enriched_log += f"\n\nOptimizer notes:\n{history.solver_instructions[:500]}"
 
         result = self.hypothesizer(
+            board_before=img_before,
+            board_after=img_after,
             frame_analysis=analysis,
             game_state=history.get_state_summary(),
             exploration_log=enriched_log,
@@ -319,8 +345,11 @@ class Solver:
 
         prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
         analysis = analyze_frame(history.last_frame, prev_frame)
+        img_before, img_after = self._get_board_images(history)
 
         result = self.iterator(
+            board_before=img_before,
+            board_after=img_after,
             frame_analysis=analysis,
             game_state=history.get_state_summary(),
             hypotheses=hypotheses_text,
@@ -366,8 +395,11 @@ class Solver:
 
         prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
         analysis = analyze_frame(history.last_frame, prev_frame)
+        img_before, img_after = self._get_board_images(history)
 
         result = self.executor(
+            board_before=img_before,
+            board_after=img_after,
             frame_analysis=analysis,
             game_state=history.get_state_summary(),
             confirmed_mechanics=mechanics_text,

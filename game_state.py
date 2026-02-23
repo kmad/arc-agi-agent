@@ -515,6 +515,13 @@ def frame_to_text(frame: np.ndarray, compact: bool = True) -> str:
         return buf.getvalue()
 
 
+def frame_to_dspy_image(frame: np.ndarray):
+    """Convert a 64x64 grid to a dspy.Image for multimodal LLM input."""
+    import dspy
+    png_bytes = frame_to_image_bytes(frame)
+    return dspy.Image(png_bytes)
+
+
 def frame_to_image_bytes(frame: np.ndarray) -> bytes:
     """Convert a 64x64 grid to a PNG image for visual analysis."""
     from PIL import Image
