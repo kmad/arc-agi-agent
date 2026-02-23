@@ -45,6 +45,7 @@ class GameHistory:
     # Exploration data (from programmatic pre-exploration)
     exploration_csv: str = ""
     exploration_summary: str = ""
+    exploration_df: object = None  # pd.DataFrame at runtime, not serialized
 
     # Per-level tracking
     level_knowledge: dict[int, list[dict]] = field(default_factory=dict)

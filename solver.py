@@ -13,11 +13,12 @@ Phases:
 """
 
 import dspy
+import io
 import json
 import numpy as np
 from enum import Enum
 from typing import Optional
-from game_state import GameHistory, frame_to_text, compute_grid_diff, analyze_frame, frame_to_dspy_image
+from game_state import GameHistory, frame_to_text, compute_grid_diff, frame_to_dspy_image
 from actions import format_action_space, get_valid_action_names
 from models import GameHypothesis, ActionEffect, FrameAnalysis, VisualAnalysis
 
@@ -53,9 +54,9 @@ class ExploreSignature(dspy.Signature):
 
     board_before: dspy.Image = dspy.InputField(desc="Screenshot of the game board BEFORE the last action")
     board_after: dspy.Image = dspy.InputField(desc="Screenshot of the game board AFTER the last action (current state)")
-    frame_analysis: str = dspy.InputField(desc="Programmatic analysis with Movement direction for last action")
+    board: str = dspy.InputField(desc="Current board state as a grid of integer cell values (rows x cols, active region only)")
     game_state: str = dspy.InputField(desc="Game state: step count, levels, recent actions")
-    exploration_data: str = dspy.InputField(desc="Pre-exploration results: per-action direction mapping, pixel changes, blocking rates")
+    exploration_data: dspy.DataFrame = dspy.InputField(desc="Pre-exploration DataFrame: columns include action, pixels_changed, direction, displacement, blocked, effective. Use pandas to query/filter/group.")
     action_effects_so_far: str = dspy.InputField(desc="What we know about each action's effect so far from the CURRENT game session")
     available_actions: str = dspy.InputField(desc="All available actions in this game")
 
@@ -80,7 +81,7 @@ class HypothesizeSignature(dspy.Signature):
 
     board_before: dspy.Image = dspy.InputField(desc="Screenshot of the game board BEFORE the last action")
     board_after: dspy.Image = dspy.InputField(desc="Screenshot of the game board AFTER the last action (current state)")
-    frame_analysis: str = dspy.InputField(desc="Programmatic analysis: objects, positions, sizes, diff from previous frame")
+    board: str = dspy.InputField(desc="Current board state as a grid of integer cell values (rows x cols, active region only)")
     game_state: str = dspy.InputField(desc="Game state summary")
     exploration_log: str = dspy.InputField(desc="Full log of actions taken and their pixel-change effects")
     available_actions: str = dspy.InputField(desc="Available actions")
@@ -104,7 +105,7 @@ class IterateSignature(dspy.Signature):
 
     board_before: dspy.Image = dspy.InputField(desc="Screenshot of the game board BEFORE the last action")
     board_after: dspy.Image = dspy.InputField(desc="Screenshot of the game board AFTER the last action (current state)")
-    frame_analysis: str = dspy.InputField(desc="Programmatic analysis: objects, positions, diffs")
+    board: str = dspy.InputField(desc="Current board state as a grid of integer cell values (rows x cols, active region only)")
     game_state: str = dspy.InputField(desc="Game state summary")
     hypotheses: str = dspy.InputField(desc="Current hypotheses with confidence levels")
     recent_test_results: str = dspy.InputField(desc="Recent action results vs predictions")
@@ -136,11 +137,9 @@ class ExecuteSignature(dspy.Signature):
 
     board_before: dspy.Image = dspy.InputField(desc="Screenshot of the game board BEFORE the last action")
     board_after: dspy.Image = dspy.InputField(desc="Screenshot of the game board AFTER the last action (current state)")
-    frame_analysis: str = dspy.InputField(desc="Programmatic analysis: objects, positions, confirmed mechanics context")
+    board: str = dspy.InputField(desc="Current board state as a grid of integer cell values (rows x cols, active region only)")
     game_state: str = dspy.InputField(desc="Game state with level info and knowledge")
     confirmed_mechanics: str = dspy.InputField(desc="Confirmed game mechanics and rules, including which actions are BLOCKED")
-    visual_analysis: str = dspy.InputField(desc="Visual observer's spatial analysis")
-    solver_directives: str = dspy.InputField(desc="Dynamic solver directives from optimizer")
     available_actions: str = dspy.InputField(desc="Available actions")
 
     plan: str = dspy.OutputField(desc="Step-by-step plan: which actions are working, which are blocked, what to do next")
@@ -254,6 +253,20 @@ class Solver:
 
         return img_before, img_after
 
+    def _get_exploration_df(self, history: GameHistory):
+        """Get the exploration DataFrame, reconstructing from CSV if needed."""
+        import pandas as pd
+        # Prefer the live DataFrame
+        df = getattr(history, 'exploration_df', None)
+        if df is not None:
+            return dspy.DataFrame(df)
+        # Fall back to CSV
+        csv = getattr(history, 'exploration_csv', '')
+        if csv:
+            return dspy.DataFrame(pd.read_csv(io.StringIO(csv)))
+        # Empty fallback
+        return dspy.DataFrame(pd.DataFrame(columns=['action', 'pixels_changed', 'direction', 'blocked', 'effective']))
+
     # ── Phase handlers ──
 
     def _explore(self, history: GameHistory) -> list[str]:
@@ -270,19 +283,16 @@ class Solver:
         # Subsequent batches: use LLM with pre-exploration data
         effects_text = self._format_action_effects()
         actions_desc = ", ".join(self.available_actions)
-        prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
-        analysis = analyze_frame(history.last_frame, prev_frame)
         img_before, img_after = self._get_board_images(history)
-
-        # Include pre-exploration data if available
-        exploration_data = getattr(history, 'exploration_summary', '') or "No pre-exploration data."
+        board_text = frame_to_text(history.last_frame)
+        exploration_df = self._get_exploration_df(history)
 
         result = self.explorer(
             board_before=img_before,
             board_after=img_after,
-            frame_analysis=analysis,
+            board=board_text,
             game_state=history.get_state_summary(),
-            exploration_data=exploration_data,
+            exploration_data=exploration_df,
             action_effects_so_far=effects_text,
             available_actions=actions_desc,
         )
@@ -299,9 +309,8 @@ class Solver:
         """HYPOTHESIZE: Synthesize observations into testable hypotheses."""
         exploration_log = history.get_recent_action_diffs(30)
         actions_desc = ", ".join(self.available_actions)
-        prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
-        analysis = analyze_frame(history.last_frame, prev_frame)
         img_before, img_after = self._get_board_images(history)
+        board_text = frame_to_text(history.last_frame)
 
         # Include action effects summary and any existing solver instructions
         enriched_log = self._format_action_effects() + "\n\n" + exploration_log
@@ -311,7 +320,7 @@ class Solver:
         result = self.hypothesizer(
             board_before=img_before,
             board_after=img_after,
-            frame_analysis=analysis,
+            board=board_text,
             game_state=history.get_state_summary(),
             exploration_log=enriched_log,
             available_actions=actions_desc,
@@ -342,15 +351,13 @@ class Solver:
 
         hypotheses_text = self._format_hypotheses_text()
         recent_results = history.get_recent_action_diffs(15)
-
-        prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
-        analysis = analyze_frame(history.last_frame, prev_frame)
         img_before, img_after = self._get_board_images(history)
+        board_text = frame_to_text(history.last_frame)
 
         result = self.iterator(
             board_before=img_before,
             board_after=img_after,
-            frame_analysis=analysis,
+            board=board_text,
             game_state=history.get_state_summary(),
             hypotheses=hypotheses_text,
             recent_test_results=recent_results,
@@ -376,35 +383,26 @@ class Solver:
 
         return self._validate_actions(result.actions)
 
-    def _execute(self, history: GameHistory, visual_obs: dict) -> list[str]:
+    def _execute(self, history: GameHistory, visual_obs: dict = None) -> list[str]:
         """EXECUTE: Fast goal-directed play using confirmed mechanics."""
         # Determine which actions are currently effective
         effective_actions = self._get_effective_actions()
         actions_desc = ", ".join(effective_actions) if effective_actions else ", ".join(self.available_actions)
 
-        visual_text = visual_obs.get("visual_analysis", "No visual analysis.")
-        if "recommended_strategy" in visual_obs:
-            visual_text += f"\nStrategy: {visual_obs['recommended_strategy']}"
-
-        solver_directives = history.solver_instructions or "Execute efficiently using confirmed mechanics."
-
-        # Combine confirmed mechanics with optimizer instructions (which may be more detailed)
+        # Combine confirmed mechanics with optimizer instructions
         mechanics_text = self._format_confirmed_mechanics()
         if history.solver_instructions:
             mechanics_text += f"\n\n--- Optimizer Strategy ---\n{history.solver_instructions[:800]}"
 
-        prev_frame = history.steps[-2].frame if len(history.steps) >= 2 else None
-        analysis = analyze_frame(history.last_frame, prev_frame)
         img_before, img_after = self._get_board_images(history)
+        board_text = frame_to_text(history.last_frame)
 
         result = self.executor(
             board_before=img_before,
             board_after=img_after,
-            frame_analysis=analysis,
+            board=board_text,
             game_state=history.get_state_summary(),
             confirmed_mechanics=mechanics_text,
-            visual_analysis=visual_text,
-            solver_directives=solver_directives,
             available_actions=actions_desc,
         )
 

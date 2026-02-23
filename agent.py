@@ -124,7 +124,8 @@ def run_agent(game_id: str = DEFAULT_GAME, max_steps: int = MAX_STEPS,
             history.game_knowledge_base.append(entry)
         print(f"  Injected {len(exploration_entries)} knowledge entries from exploration")
 
-        # Store the DataFrame as CSV string for RLM access
+        # Store the DataFrame for RLM sandbox access and CSV for serialization
+        history.exploration_df = exploration_df
         history.exploration_csv = exploration_df.to_csv(index=False)
         history.exploration_summary = exploration_summary
 
